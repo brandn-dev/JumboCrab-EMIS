@@ -17,6 +17,7 @@ import {
 import { listContributionDirectory } from "@/actions/contributions/contributions-action";
 import { getSession } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { isEmployeeEndedStatus } from "@/lib/employees/status";
 import { endOfZonedDay, startOfZonedDay } from "@/lib/timezone";
 
 const REPORT_VIEW = {
@@ -977,7 +978,6 @@ async function fetchEmployeeInformationReport(input?: ReportFilterInput) {
       currentStatus: true,
       email: true,
       phone: true,
-      isEnded: true,
       isArchived: true,
       createdAt: true,
       updatedAt: true,
@@ -998,7 +998,7 @@ async function fetchEmployeeInformationReport(input?: ReportFilterInput) {
     phone: record.phone ?? null,
     startDate: record.startDate.toISOString(),
     endDate: toIsoString(record.endDate),
-    isEnded: Boolean(record.isEnded),
+    isEnded: isEmployeeEndedStatus(record.currentStatus),
     isArchived: record.isArchived,
     createdAt: record.createdAt.toISOString(),
     updatedAt: record.updatedAt.toISOString(),

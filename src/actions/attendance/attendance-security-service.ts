@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
 import {
   normalizeLatitude,
@@ -7,6 +8,7 @@ import {
 } from "./attendance-security-shared";
 
 export async function captureAttendanceSecurityEvent(input: {
+  punchId: string;
   attendanceId: string;
   employeeId: string;
   punchTime: Date;
@@ -27,19 +29,53 @@ export async function captureAttendanceSecurityEvent(input: {
       ? input.payload.userAgent.trim().slice(0, 1000)
       : null;
 
-  const contextLog = await client.attendanceContextLog.create({
-    data: {
-      attendanceId: input.attendanceId,
-      employeeId: input.employeeId,
-      ipAddress,
-      userAgent,
-      latitude,
-      longitude,
-      createdAt: input.punchTime,
-    },
-  });
+  const writeSecurityContext = async (writeClient: AttendanceSecurityClient) => {
+    await writeClient.punch.update({
+      where: { id: input.punchId },
+      data: {
+        ipAddress,
+        userAgent,
+        latitude,
+        longitude,
+      },
+    });
+
+    if (process.env.ATTENDANCE_CONTEXT_LOG_DUAL_WRITE === "false") {
+      return null;
+    }
+
+    const contextLogId = randomUUID();
+    await writeClient.$executeRaw`
+      INSERT INTO "AttendanceContextLog" (
+        "id",
+        "punchId",
+        "attendanceId",
+        "employeeId",
+        "ipAddress",
+        "userAgent",
+        "latitude",
+        "longitude",
+        "createdAt"
+      ) VALUES (
+        ${contextLogId},
+        ${input.punchId},
+        ${input.attendanceId},
+        ${input.employeeId},
+        ${ipAddress},
+        ${userAgent},
+        ${latitude},
+        ${longitude},
+        ${input.punchTime}
+      )
+    `;
+    return contextLogId;
+  };
+
+  const contextLogId = input.client
+    ? await writeSecurityContext(client)
+    : await db.$transaction((transaction) => writeSecurityContext(transaction));
 
   return {
-    contextLogId: contextLog.id,
+    contextLogId,
   };
 }

@@ -16,8 +16,9 @@ import {
 import type { EmployeeActionRecord } from "./types";
 
 export async function updateEmployee(
-  employeeData: Partial<PrismaEmployee> & {
+  employeeData: Partial<Omit<PrismaEmployee, "isEnded">> & {
     employeeId: string;
+    isEnded?: boolean | null;
   },
 ): Promise<{
   success: boolean;
@@ -88,7 +89,6 @@ export async function updateEmployee(
       "country",
       "img",
       "endDate",
-      "isEnded",
       "email",
       "phone",
       "description",

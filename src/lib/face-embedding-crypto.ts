@@ -73,10 +73,17 @@ export const faceDistance = (left: number[], right: number[]) => {
     return Number.POSITIVE_INFINITY;
   }
 
-  let sum = 0;
+  let dot = 0;
+  let leftMagnitude = 0;
+  let rightMagnitude = 0;
   for (let index = 0; index < left.length; index += 1) {
-    const delta = left[index] - right[index];
-    sum += delta * delta;
+    dot += left[index] * right[index];
+    leftMagnitude += left[index] * left[index];
+    rightMagnitude += right[index] * right[index];
   }
-  return Math.sqrt(sum);
+
+  const denominator = Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude);
+  if (denominator <= 0) return Number.POSITIVE_INFINITY;
+
+  return 1 - dot / denominator;
 };

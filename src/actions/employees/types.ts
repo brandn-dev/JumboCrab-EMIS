@@ -1,6 +1,7 @@
 import type { Employee as PrismaEmployee } from "@prisma/client";
 
-export type EmployeeActionRecord = PrismaEmployee & {
+export type EmployeeActionRecord = Omit<PrismaEmployee, "isEnded"> & {
+  isEnded: boolean;
   dailyRate: number | null;
   hourlyRate: number | null;
   monthlyRate: number | null;

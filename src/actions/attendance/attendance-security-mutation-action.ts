@@ -6,6 +6,9 @@ import { db } from "@/lib/db";
 import {
   ATTENDANCE_SECURITY_SETTINGS_ID,
   ATTENDANCE_PUNCH_MODES,
+  FACE_MATCH_DEFAULT_DISTANCE,
+  FACE_MATCH_MAX_DISTANCE,
+  FACE_MATCH_MIN_DISTANCE,
   canManageAttendanceSecuritySettings,
   deriveLegacyFaceFlags,
   hasAttendancePunchModeColumn,
@@ -54,8 +57,11 @@ export async function updateAttendanceSecuritySettings(input: {
       faceRequiredForQrPunch: legacyFlags.faceRequiredForQrPunch,
       faceLivenessRequired: input.faceLivenessRequired !== false,
       faceMatchMaxDistance: Math.max(
-        0.45,
-        Math.min(0.6, Number(input.faceMatchMaxDistance) || 0.5),
+        FACE_MATCH_MIN_DISTANCE,
+        Math.min(
+          FACE_MATCH_MAX_DISTANCE,
+          Number(input.faceMatchMaxDistance) || FACE_MATCH_DEFAULT_DISTANCE,
+        ),
       ),
       faceFailureMode:
         typeof input.faceFailureMode === "string" &&

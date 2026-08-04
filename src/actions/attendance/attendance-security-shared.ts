@@ -10,6 +10,11 @@ export const ATTENDANCE_PUNCH_MODES = {
   SEARCH_EMPLOYEE_KIOSK_FACE: "SEARCH_EMPLOYEE_KIOSK_FACE",
 } as const;
 
+export const FACE_MATCH_MIN_DISTANCE = 0.35;
+export const FACE_MATCH_MAX_DISTANCE = 0.55;
+export const FACE_MATCH_DEFAULT_DISTANCE = 0.35;
+export const FACE_MATCH_AMBIGUITY_MARGIN = 0.05;
+
 export type AttendancePunchModeValue =
   (typeof ATTENDANCE_PUNCH_MODES)[keyof typeof ATTENDANCE_PUNCH_MODES];
 
@@ -19,7 +24,7 @@ export const DEFAULT_ATTENDANCE_SECURITY_SETTINGS = {
   faceRecognitionEnabled: false,
   faceRequiredForQrPunch: false,
   faceLivenessRequired: true,
-  faceMatchMaxDistance: 0.5,
+  faceMatchMaxDistance: FACE_MATCH_DEFAULT_DISTANCE,
   faceFailureMode: "BLOCK",
 } as const;
 

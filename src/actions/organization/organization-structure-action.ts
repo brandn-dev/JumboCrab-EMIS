@@ -2,6 +2,7 @@
 
 import { Roles } from "@prisma/client";
 import { db } from "@/lib/db";
+import { requireOrganizationMutationAccess } from "./organization-auth";
 
 type SupervisorUser = {
   userId: string;
@@ -149,6 +150,9 @@ export async function updateEmployeeSupervisor(input: {
   supervisorUserId?: string | null;
 }): Promise<{ success: boolean; error?: string }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const employeeId =
       typeof input.employeeId === "string" ? input.employeeId.trim() : "";
     const supervisorId =
@@ -195,6 +199,9 @@ export async function updateEmployeesSupervisorBulk(input: {
   supervisorUserId?: string | null;
 }): Promise<{ success: boolean; updatedCount?: number; error?: string }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const employeeIds = Array.isArray(input.employeeIds)
       ? Array.from(
           new Set(

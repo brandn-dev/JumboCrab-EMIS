@@ -28,7 +28,7 @@ const defaultForm: AttendanceSecuritySettingsForm = {
   gpsValidationEnabled: false,
   attendancePunchMode: "QR_ONLY",
   faceLivenessRequired: true,
-  faceMatchMaxDistance: 0.5,
+  faceMatchMaxDistance: 0.35,
   faceFailureMode: "BLOCK",
 };
 
@@ -123,8 +123,8 @@ export function AttendanceSecuritySettingsPage() {
       const result = await updateAttendanceSecuritySettings({
         ...form,
         faceMatchMaxDistance: Math.max(
-          0.45,
-          Math.min(0.6, Number(form.faceMatchMaxDistance) || 0.5),
+          0.35,
+          Math.min(0.55, Number(form.faceMatchMaxDistance) || 0.35),
         ),
       });
 
@@ -242,13 +242,13 @@ export function AttendanceSecuritySettingsPage() {
           <div className="space-y-2">
             <p className="font-medium">Face match distance threshold</p>
             <p className="text-sm text-muted-foreground">
-              Lower is stricter. Start at 0.50, then tune after real employee
+              Lower is stricter. Start at 0.35, then tune after real employee
               enrollment tests.
             </p>
             <Input
               type="number"
-              min={0.45}
-              max={0.6}
+              min={0.35}
+              max={0.55}
               step={0.01}
               value={form.faceMatchMaxDistance}
               onChange={(event) =>

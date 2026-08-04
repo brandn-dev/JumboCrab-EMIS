@@ -1,6 +1,6 @@
 "use server";
 
-import { LeaveRequestStatus } from "@prisma/client";
+import { CURRENT_STATUS, LeaveRequestStatus } from "@prisma/client";
 import type { LeaveRequestType } from "@prisma/client";
 import { db } from "@/lib/db";
 import { getSession } from "@/lib/auth";
@@ -221,7 +221,9 @@ export async function getWeekPlannerSnapshot(input?: {
       db.employee.findMany({
         where: {
           isArchived: false,
-          OR: [{ isEnded: false }, { isEnded: null }],
+          currentStatus: {
+            notIn: [CURRENT_STATUS.INACTIVE, CURRENT_STATUS.ENDED],
+          },
         },
         orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
         select: employeeSelect,
@@ -356,7 +358,9 @@ export async function saveWeekPlannerAssignments(input: {
         where: {
           employeeId: { in: employeeIds },
           isArchived: false,
-          OR: [{ isEnded: false }, { isEnded: null }],
+          currentStatus: {
+            notIn: [CURRENT_STATUS.INACTIVE, CURRENT_STATUS.ENDED],
+          },
         },
         select: { employeeId: true },
       }),

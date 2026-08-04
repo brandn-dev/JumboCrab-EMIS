@@ -224,6 +224,7 @@ export async function recordKioskPunch(input: {
 
     if (result.attendance?.id) {
       await captureAttendanceSecurityEvent({
+        punchId: result.punch.id,
         attendanceId: result.attendance.id,
         employeeId: user.employee.employeeId,
         punchTime: now,

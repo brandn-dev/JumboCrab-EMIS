@@ -56,12 +56,14 @@ export async function createEmployee(employeeData: Employee): Promise<{
       userId,
       departmentId,
       positionId,
+      isEnded: _legacyIsEnded,
       department: _legacyDepartment,
       position: _legacyPosition,
       ...baseData
     } = parsed.data;
     void _legacyDepartment;
     void _legacyPosition;
+    void _legacyIsEnded;
 
     const { suffix, ...restBaseData } = baseData;
     type AllowedSuffix = (typeof SUFFIX)[number];

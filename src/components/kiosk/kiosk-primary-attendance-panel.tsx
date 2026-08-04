@@ -20,10 +20,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast-provider";
 import {
-  FaceApiClientError,
-  captureFrontFaceVerificationPayload,
-  loadFaceApiModels,
-} from "@/lib/face-api-client";
+  FaceCaptureClientError,
+  captureFrontFaceFrames,
+} from "@/lib/face-capture-client";
 
 type AttendancePunchMode =
   | "QR_ONLY"
@@ -317,8 +316,7 @@ export function KioskPrimaryAttendancePanel({
           throw new Error(cameraUnavailableMessage);
         }
 
-        const modelsPromise = loadFaceApiModels();
-        const streamPromise = navigator.mediaDevices.getUserMedia({
+        const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: "user",
             width: { ideal: 720 },
@@ -326,7 +324,6 @@ export function KioskPrimaryAttendancePanel({
           },
           audio: false,
         });
-        const [stream] = await Promise.all([streamPromise, modelsPromise]);
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
           return;
@@ -469,8 +466,12 @@ export function KioskPrimaryAttendancePanel({
     try {
       setFaceSubmitting(true);
       setError(null);
-      setFaceAutoStatus("Face camera directly");
-      const facePayload = await captureFrontFaceVerificationPayload(video);
+      setFaceAutoStatus("Face camera directly and blink once");
+      const facePayload = await captureFrontFaceFrames(video, {
+        frameCount: 8,
+        delayMs: 150,
+        blinkPrompted: true,
+      });
       if (faceAttemptSessionRef.current !== sessionId) return;
 
       setFaceAutoStatus("Verifying");
@@ -480,7 +481,7 @@ export function KioskPrimaryAttendancePanel({
           typeof window !== "undefined"
             ? process.env.NEXT_PUBLIC_KIOSK_ID || window.location.hostname
             : process.env.NEXT_PUBLIC_KIOSK_ID || "KIOSK",
-        descriptor: facePayload.descriptor,
+        frames: facePayload.frames,
         livenessPassed: facePayload.livenessPassed,
         livenessPrompt: facePayload.livenessPrompt,
         faceCount: facePayload.faceCount,
@@ -495,8 +496,11 @@ export function KioskPrimaryAttendancePanel({
           "no_face_detected",
           "multiple_faces",
           "face_mismatch",
+          "ambiguous_face_match",
           "liveness_failed",
-          "missing_face_descriptor",
+          "missing_face_frames",
+          "face_service_error",
+          "face_service_timeout",
         ]);
         if (
           result.reason &&
@@ -526,7 +530,7 @@ export function KioskPrimaryAttendancePanel({
       });
     } catch (err) {
       if (
-        err instanceof FaceApiClientError &&
+        err instanceof FaceCaptureClientError &&
         faceAttemptSessionRef.current === sessionId
       ) {
         setFaceAutoStatus(err.message);
@@ -732,7 +736,7 @@ export function KioskPrimaryAttendancePanel({
             </div>
 
             <div className="relative mx-auto max-w-sm overflow-hidden rounded-xl bg-black">
-              <div className="pointer-events-none absolute inset-x-3 top-3 z-10 rounded-lg bg-black/75 px-3 py-3 text-center text-xl font-bold tracking-wide text-white">
+              <div className="pointer-events-none absolute inset-x-3 top-3 z-20 rounded-lg bg-black/75 px-3 py-3 text-center text-xl font-bold tracking-wide text-white">
                 FACE CAMERA DIRECTLY
               </div>
               <video
@@ -742,13 +746,23 @@ export function KioskPrimaryAttendancePanel({
                 playsInline
                 muted
               />
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center"
+              >
+                <div className="relative h-[62%] w-[52%] rounded-[50%] border-2 border-white/80 shadow-[0_0_0_999px_rgba(0,0,0,0.28)]">
+                  <div className="absolute left-[18%] right-[18%] top-[38%] border-t border-white/70" />
+                  <div className="absolute bottom-[18%] left-1/2 top-[18%] border-l border-white/35" />
+                  <div className="absolute -bottom-[18%] left-1/2 h-[22%] w-[78%] -translate-x-1/2 rounded-t-full border-t border-white/50" />
+                </div>
+              </div>
             </div>
 
             <div className="grid gap-2 sm:grid-cols-2">
               <div className="rounded-lg border bg-muted/20 px-3 py-2 text-sm">
-                <p className="text-xs text-muted-foreground">Face models</p>
+                <p className="text-xs text-muted-foreground">Face service</p>
                 <p className="font-medium">
-                  {faceModelsReady ? "Loaded" : "Loading..."}
+                  {faceModelsReady ? "Ready" : "Starting..."}
                 </p>
               </div>
               <div className="rounded-lg border bg-muted/20 px-3 py-2 text-sm">

@@ -1,6 +1,7 @@
 import { revalidatePath } from "next/cache";
 import { db } from "@/lib/db";
 import { Roles, type Employee as PrismaEmployee, type Prisma } from "@prisma/client";
+import { isEmployeeEndedStatus } from "@/lib/employees/status";
 import type { EmployeeActionRecord } from "./types";
 
 export const employeeLookupInclude = {
@@ -177,6 +178,7 @@ export const serializeEmployeeRecord = (
   employee: EmployeeWithCurrentRate,
 ): EmployeeActionRecord => ({
   ...employee,
+  isEnded: isEmployeeEndedStatus(employee.currentStatus),
   dailyRate: toRateNumber(employee.position?.dailyRate),
   hourlyRate: toRateNumber(employee.position?.hourlyRate),
   monthlyRate: toRateNumber(employee.position?.monthlyRate),

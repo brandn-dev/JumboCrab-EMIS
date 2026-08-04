@@ -200,7 +200,6 @@ export const serializeEarningLine = (line: {
   minutes: number | null;
   rateSnapshot: unknown;
   source: PayrollLineSource;
-  isManual: boolean;
   referenceType: PayrollReferenceType | null;
   referenceId: string | null;
   remarks: string | null;
@@ -212,7 +211,7 @@ export const serializeEarningLine = (line: {
   minutes: line.minutes ?? null,
   rateSnapshot: toNumberOrNull(line.rateSnapshot),
   source: line.source,
-  isManual: line.isManual,
+  isManual: line.source === PayrollLineSource.MANUAL,
   referenceType: line.referenceType,
   referenceId: line.referenceId,
   remarks: line.remarks,
@@ -244,7 +243,6 @@ export const serializeDeductionLine = (line: {
   minutes: number | null;
   rateSnapshot: unknown;
   source: PayrollLineSource;
-  isManual: boolean;
   referenceType: PayrollReferenceType | null;
   referenceId: string | null;
   remarks: string | null;
@@ -274,7 +272,7 @@ export const serializeDeductionLine = (line: {
   minutes: line.minutes ?? null,
   rateSnapshot: toNumberOrNull(line.rateSnapshot),
   source: line.source,
-  isManual: line.isManual,
+  isManual: line.source === PayrollLineSource.MANUAL,
   referenceType: line.referenceType,
   referenceId: line.referenceId,
   remarks: line.remarks,

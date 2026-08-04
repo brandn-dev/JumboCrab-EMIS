@@ -14,6 +14,7 @@ import {
   isArchivedTokenName,
   resolvePositionRestoreName,
 } from "./positions-shared";
+import { requireOrganizationMutationAccess } from "./organization-auth";
 
 const serializePositionDetail = (position: {
   positionId: string;
@@ -59,6 +60,9 @@ export async function createPosition(input: {
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const name = typeof input.name === "string" ? input.name.trim() : "";
     const description =
       typeof input.description === "string" ? input.description.trim() : null;
@@ -174,6 +178,9 @@ export async function updatePosition(input: {
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const positionId =
       typeof input.positionId === "string" ? input.positionId.trim() : "";
     const name = typeof input.name === "string" ? input.name.trim() : "";
@@ -308,6 +315,9 @@ export async function archivePosition(positionId: string): Promise<{
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const id = typeof positionId === "string" ? positionId.trim() : "";
     if (!id) {
       return { success: false, error: "Position ID is required" };
@@ -349,6 +359,9 @@ export async function unarchivePosition(positionId: string): Promise<{
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const id = typeof positionId === "string" ? positionId.trim() : "";
     if (!id) {
       return { success: false, error: "Position ID is required" };

@@ -20,6 +20,19 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## Face Verification Service
+
+Attendance face verification uses a local Python InsightFace service. Run the service from `face-service/`, then set these environment variables for the Next.js app:
+
+```bash
+FACE_SERVICE_URL=http://YOUR_PROXMOX_VM_IP:8001
+FACE_SERVICE_API_KEY=change-this-long-random-key
+FACE_MATCH_PROVIDER=insightface
+FACE_ENCRYPTION_KEY=change-this-long-random-secret
+```
+
+Employees must re-enroll face templates after switching to InsightFace.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:

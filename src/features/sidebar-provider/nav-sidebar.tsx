@@ -147,21 +147,21 @@ const NavSidebar = ({ userRole }: NavSidebarProps) => {
         {
           label: "Departments",
           path: "/departments",
-          roles: ["admin", "generalManager", "manager"],
+          roles: ["admin", "generalManager"],
         },
         {
           label: "Positions",
           path: "/positions",
-          roles: ["admin", "generalManager", "manager"],
+          roles: ["admin", "generalManager"],
         },
         {
           label: "Structure",
           path: "/structure",
-          roles: ["admin", "generalManager", "manager"],
+          roles: ["admin", "generalManager"],
         },
       ],
       // ========== ORGANIZATION ACCESS ========= //
-      roles: ["admin", "generalManager", "manager"],
+      roles: ["admin", "generalManager"],
     },
     // ========== ATTENDANCE MENU ========== //
     {

@@ -205,6 +205,7 @@ export async function recordSelfPunch(input: {
 
     if (punch.attendance?.id) {
       await captureAttendanceSecurityEvent({
+        punchId: punch.punch.id,
         attendanceId: punch.attendance.id,
         employeeId: employee.employeeId,
         punchTime: now,

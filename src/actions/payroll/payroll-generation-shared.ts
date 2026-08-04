@@ -74,7 +74,6 @@ export type PayrollEarningDraft = {
   minutes?: number;
   rateSnapshot?: number;
   source: PayrollLineSource;
-  isManual: boolean;
   referenceType?: PayrollReferenceType;
   referenceId?: string;
   remarks?: string;
@@ -104,7 +103,6 @@ export type PayrollDeductionDraft = {
   minutes?: number;
   rateSnapshot?: number;
   source: PayrollLineSource;
-  isManual: boolean;
   referenceType?: PayrollReferenceType;
   referenceId?: string;
   remarks?: string;
@@ -519,7 +517,6 @@ export const buildEmployeePayrollDraft = (input: {
           ? distinctRateSnapshots[0]
           : undefined,
       source: PayrollLineSource.SYSTEM,
-      isManual: false,
       referenceType: PayrollReferenceType.ATTENDANCE,
       referenceId: payrollId,
       remarks:
@@ -539,7 +536,6 @@ export const buildEmployeePayrollDraft = (input: {
           ? distinctRateSnapshots[0]
           : undefined,
       source: PayrollLineSource.SYSTEM,
-      isManual: false,
       referenceType: PayrollReferenceType.ATTENDANCE,
       referenceId: payrollId,
       remarks:
@@ -570,7 +566,6 @@ export const buildEmployeePayrollDraft = (input: {
           ? distinctRateSnapshots[0]
           : undefined,
       source: PayrollLineSource.SYSTEM,
-      isManual: false,
       referenceType: PayrollReferenceType.ATTENDANCE,
       referenceId: payrollId,
       remarks: `Computed from attendance undertime minutes (${UNDERTIME_DEDUCTION_MULTIPLIER}x, grace-aware)`,
@@ -661,7 +656,6 @@ export const buildEmployeePayrollDraft = (input: {
           },
           amount: roundCurrency(calculation.employeeShare),
           source: PayrollLineSource.CONTRIBUTION_ENGINE,
-          isManual: false,
           referenceType: PayrollReferenceType.CONTRIBUTION,
           referenceId: calculation.bracket.id,
           remarks: `${contributionType} statutory contribution`,
@@ -718,7 +712,6 @@ export const buildEmployeePayrollDraft = (input: {
           },
           amount: roundCurrency(withholding.employeeShare),
           source: PayrollLineSource.CONTRIBUTION_ENGINE,
-          isManual: false,
           referenceType: PayrollReferenceType.CONTRIBUTION,
           referenceId: withholding.bracket.id,
           remarks: "Withholding tax",
@@ -790,7 +783,6 @@ export const buildEmployeePayrollDraft = (input: {
       },
       amount,
       source: PayrollLineSource.SYSTEM,
-      isManual: false,
       referenceType: PayrollReferenceType.MANUAL,
       referenceId: assignment.id,
       remarks:

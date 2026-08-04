@@ -16,6 +16,12 @@ import {
   faceDistance,
 } from "@/lib/face-embedding-crypto";
 import {
+  FaceServiceError,
+  INSIGHTFACE_MODEL_VERSION,
+  embedFaceFrames,
+  isInsightFaceModel,
+} from "@/lib/face-service-client";
+import {
   computeBreakStats,
   getAttendanceFreezeStateForMoment,
   isSelfPunchIpAllowed,
@@ -24,11 +30,11 @@ import {
 import { isKioskPunchIpAllowed } from "./kiosk-attendance-shared";
 import { captureAttendanceSecurityEvent } from "./attendance-security-service";
 import {
+  ATTENDANCE_PUNCH_MODES,
+  FACE_MATCH_AMBIGUITY_MARGIN,
+  FACE_MATCH_DEFAULT_DISTANCE,
   ensureAttendanceSecuritySettings,
   resolveAttendanceRequestMetadata,
-} from "./attendance-security-shared";
-import {
-  ATTENDANCE_PUNCH_MODES,
 } from "./attendance-security-shared";
 import {
   buildPunchSuccessPayload,
@@ -40,7 +46,9 @@ import {
 
 const MIN_ENROLLMENT_SAMPLES = 3;
 const MAX_ENROLLMENT_SAMPLES = 5;
-const FACE_DESCRIPTOR_LENGTH = 128;
+const MAX_ENROLLMENT_SAMPLE_DISTANCE = 0.32;
+const MAX_ACTIVE_FACE_ENROLLMENTS_PER_EMPLOYEE = 3;
+const FACE_DUPLICATE_ENROLLMENT_DISTANCE = FACE_MATCH_DEFAULT_DISTANCE;
 
 const FACE_CONSENT_TEXT =
   "Employee consented to store encrypted face templates for attendance verification. Raw enrollment and punch photos are not stored by default.";
@@ -51,33 +59,8 @@ const canManageFaceEnrollments = (role?: Roles) =>
 const canViewFaceEnrollments = (role?: Roles) =>
   canManageFaceEnrollments(role) || role === Roles.GeneralManager || role === Roles.Employee;
 
-const normalizeDescriptor = (descriptor: unknown) => {
-  if (!Array.isArray(descriptor) || descriptor.length !== FACE_DESCRIPTOR_LENGTH) {
-    return null;
-  }
-
-  const normalized = descriptor.map((value) => Number(value));
-  if (
-    normalized.some(
-      (value) => !Number.isFinite(value) || Math.abs(value) > 10,
-    )
-  ) {
-    return null;
-  }
-
-  return normalized;
-};
-
-const normalizeDescriptorList = (descriptors: unknown) => {
-  if (!Array.isArray(descriptors)) return [];
-  return descriptors
-    .map((descriptor) => normalizeDescriptor(descriptor))
-    .filter((descriptor): descriptor is number[] => Boolean(descriptor))
-    .slice(0, MAX_ENROLLMENT_SAMPLES);
-};
-
 const averageDescriptors = (descriptors: number[][]) =>
-  Array.from({ length: FACE_DESCRIPTOR_LENGTH }, (_, index) => {
+  Array.from({ length: descriptors[0]?.length ?? 0 }, (_, index) => {
     const sum = descriptors.reduce(
       (total, descriptor) => total + descriptor[index],
       0,
@@ -85,15 +68,128 @@ const averageDescriptors = (descriptors: number[][]) =>
     return sum / descriptors.length;
   });
 
+const normalizeFaceFrames = (frames: unknown, maxFrames = MAX_ENROLLMENT_SAMPLES) => {
+  if (!Array.isArray(frames)) return [];
+  return frames
+    .filter((frame): frame is string => {
+      if (typeof frame !== "string") return false;
+      const normalized = frame.includes(",") ? frame.split(",").pop() : frame;
+      return Boolean(normalized && normalized.length > 100);
+    })
+    .map((frame) => (frame.includes(",") ? frame.split(",").pop() ?? "" : frame))
+    .slice(0, maxFrames);
+};
+
+const maxPairwiseFaceDistance = (descriptors: number[][]) => {
+  let maxDistance = 0;
+
+  for (let left = 0; left < descriptors.length; left += 1) {
+    for (let right = left + 1; right < descriptors.length; right += 1) {
+      maxDistance = Math.max(
+        maxDistance,
+        faceDistance(descriptors[left], descriptors[right]),
+      );
+    }
+  }
+
+  return maxDistance;
+};
+
+type NearestFaceMatch = {
+  employeeId: string;
+  enrollmentId: string;
+  distance: number;
+};
+
+const findNearestOtherActiveFace = async (
+  employeeId: string,
+  descriptor: number[],
+): Promise<NearestFaceMatch | null> => {
+  const otherEnrollments = await db.employeeFaceEnrollment.findMany({
+    where: {
+      employeeId: { not: employeeId },
+      isActive: true,
+    },
+    select: {
+      id: true,
+      employeeId: true,
+      embedding: true,
+      modelVersion: true,
+    },
+  });
+
+  return otherEnrollments.reduce<NearestFaceMatch | null>((nearest, row) => {
+    if (!isInsightFaceModel(row.modelVersion)) return nearest;
+    const distance = faceDistance(decryptFaceEmbedding(row.embedding), descriptor);
+    if (!Number.isFinite(distance)) return nearest;
+    if (!nearest || distance < nearest.distance) {
+      return {
+        employeeId: row.employeeId,
+        enrollmentId: row.id,
+        distance,
+      };
+    }
+    return nearest;
+  }, null);
+};
+
+const evaluateFaceMatch = async (input: {
+  employeeId: string;
+  descriptor: number[];
+  activeEnrollments: Array<{ embedding: Buffer | Uint8Array; modelVersion: string }>;
+  threshold: number;
+}) => {
+  const targetDistances = input.activeEnrollments.map((enrollment) =>
+    faceDistance(decryptFaceEmbedding(enrollment.embedding), input.descriptor),
+  );
+  const bestDistance = Math.min(...targetDistances);
+  const nearestOther = await findNearestOtherActiveFace(
+    input.employeeId,
+    input.descriptor,
+  );
+
+  if (!Number.isFinite(bestDistance) || bestDistance > input.threshold) {
+    return {
+      success: false as const,
+      reason: "face_mismatch",
+      error: "Face did not match enrolled employee.",
+      bestDistance: Number.isFinite(bestDistance) ? bestDistance : null,
+      nearestOther,
+    };
+  }
+
+  if (
+    nearestOther &&
+    nearestOther.distance <= bestDistance + FACE_MATCH_AMBIGUITY_MARGIN
+  ) {
+    return {
+      success: false as const,
+      reason: "ambiguous_face_match",
+      error:
+        nearestOther.distance < bestDistance
+          ? "Face matched another employee more closely."
+          : "Face match is too close to another employee. Please retry or re-enroll.",
+      bestDistance,
+      nearestOther,
+    };
+  }
+
+  return {
+    success: true as const,
+    bestDistance,
+    nearestOther,
+  };
+};
+
 const toJsonValue = (value: unknown) =>
   value == null
     ? undefined
     : (JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue);
 
 const normalizeModelVersion = (value: unknown) => {
-  if (typeof value !== "string") return "face-api.js/browser";
+  if (typeof value !== "string") return INSIGHTFACE_MODEL_VERSION;
   const normalized = value.trim();
-  return normalized ? normalized.slice(0, 191) : "face-api.js/browser";
+  return normalized ? normalized.slice(0, 191) : INSIGHTFACE_MODEL_VERSION;
 };
 
 const serializeEnrollment = (row: {
@@ -272,10 +368,12 @@ export async function listEmployeeFaceVerificationAttempts(employeeId: string) {
 
 export async function enrollEmployeeFace(input: {
   employeeId: string;
-  descriptors: number[][];
+  frames: string[];
   modelVersion?: string | null;
   descriptorMetadata?: unknown;
+  faceMetadata?: unknown;
   consentText?: string | null;
+  replaceExisting?: boolean | null;
 }) {
   try {
     const session = await getSession();
@@ -297,38 +395,136 @@ export async function enrollEmployeeFace(input: {
       return { success: false, error: "Employee not found" };
     }
 
-    const descriptors = normalizeDescriptorList(input.descriptors);
-    if (descriptors.length < MIN_ENROLLMENT_SAMPLES) {
+    const frames = normalizeFaceFrames(input.frames);
+    if (frames.length < MIN_ENROLLMENT_SAMPLES) {
       return {
         success: false,
         error: `Capture at least ${MIN_ENROLLMENT_SAMPLES} clear face samples.`,
       };
     }
 
-    const averagedDescriptor = averageDescriptors(descriptors);
+    const embeddingResults = await Promise.all(
+      frames.map((frame) =>
+        embedFaceFrames({
+          frames: [frame],
+          purpose: "enrollment",
+          requireFrontFace: true,
+        }),
+      ),
+    );
+    const embeddings = embeddingResults.map((result) => result.embedding);
+    const modelVersion = normalizeModelVersion(embeddingResults[0]?.modelVersion);
+    const serviceLatencyMs = embeddingResults.reduce(
+      (total, result) => total + (result.serviceLatencyMs ?? 0),
+      0,
+    );
+    const sampleSpread = maxPairwiseFaceDistance(embeddings);
+    if (sampleSpread > MAX_ENROLLMENT_SAMPLE_DISTANCE) {
+      await logFaceAttempt({
+        employeeId,
+        status: "FAILED",
+        reason: "poor_enrollment_consistency",
+        distance: sampleSpread,
+        threshold: MAX_ENROLLMENT_SAMPLE_DISTANCE,
+        modelVersion,
+        serviceLatencyMs,
+        faceCount: frames.length,
+        details: {
+          sampleCount: frames.length,
+          faceMetadata: input.faceMetadata ?? input.descriptorMetadata ?? null,
+          quality: embeddingResults.map((result) => result.quality),
+        },
+      });
+      return {
+        success: false,
+        error:
+          "Face samples are inconsistent. Re-enroll with only the target employee in frame.",
+        reason: "poor_enrollment_consistency",
+      };
+    }
+
+    const averagedDescriptor = averageDescriptors(embeddings);
+    const nearestOther = await findNearestOtherActiveFace(
+      employeeId,
+      averagedDescriptor,
+    );
+    if (
+      nearestOther &&
+      nearestOther.distance <= FACE_DUPLICATE_ENROLLMENT_DISTANCE
+    ) {
+      await logFaceAttempt({
+        employeeId,
+        status: "FAILED",
+        reason: "duplicate_face_enrollment",
+        distance: nearestOther.distance,
+        threshold: FACE_DUPLICATE_ENROLLMENT_DISTANCE,
+        modelVersion,
+        serviceLatencyMs,
+        faceCount: frames.length,
+        details: {
+          matchedEmployeeId: nearestOther.employeeId,
+          matchedEnrollmentId: nearestOther.enrollmentId,
+          sampleCount: frames.length,
+          faceMetadata: input.faceMetadata ?? input.descriptorMetadata ?? null,
+          quality: embeddingResults.map((result) => result.quality),
+        },
+      });
+      return {
+        success: false,
+        error:
+          "This face is already too close to another active employee enrollment.",
+        reason: "duplicate_face_enrollment",
+      };
+    }
+
     const encryptedEmbedding = encryptFaceEmbedding(averagedDescriptor);
-    const modelVersion = normalizeModelVersion(input.modelVersion);
     const consentText =
       typeof input.consentText === "string" && input.consentText.trim()
         ? input.consentText.trim()
         : FACE_CONSENT_TEXT;
+    const replaceExisting = input.replaceExisting === true;
 
     const enrollment = await db.$transaction(async (tx) => {
-      await tx.employeeFaceEnrollment.updateMany({
-        where: { employeeId, isActive: true },
-        data: {
-          isActive: false,
-          revokedAt: new Date(),
-          revokedByUserId: session.userId ?? null,
-          revokeReason: "Replaced by new face enrollment.",
-        },
-      });
+      if (replaceExisting) {
+        await tx.employeeFaceEnrollment.updateMany({
+          where: { employeeId, isActive: true },
+          data: {
+            isActive: false,
+            revokedAt: new Date(),
+            revokedByUserId: session.userId ?? null,
+            revokeReason: "Replaced by new face enrollment.",
+          },
+        });
+      } else {
+        const activeEnrollments = await tx.employeeFaceEnrollment.findMany({
+          where: { employeeId, isActive: true },
+          orderBy: { createdAt: "desc" },
+          select: { id: true },
+        });
+        const enrollmentsToRevoke = activeEnrollments.slice(
+          MAX_ACTIVE_FACE_ENROLLMENTS_PER_EMPLOYEE - 1,
+        );
+
+        if (enrollmentsToRevoke.length > 0) {
+          await tx.employeeFaceEnrollment.updateMany({
+            where: {
+              id: { in: enrollmentsToRevoke.map((row) => row.id) },
+            },
+            data: {
+              isActive: false,
+              revokedAt: new Date(),
+              revokedByUserId: session.userId ?? null,
+              revokeReason: "Rotated out after adding appearance variant.",
+            },
+          });
+        }
+      }
 
       return tx.employeeFaceEnrollment.create({
         data: {
           employeeId,
           embedding: encryptedEmbedding,
-          sampleCount: descriptors.length,
+          sampleCount: frames.length,
           modelVersion,
           consentText,
           consentedAt: new Date(),
@@ -447,7 +643,7 @@ export async function verifyFaceAndRecordKioskPunch(input: {
   employeeQrToken?: string | null;
   employeeId?: string | null;
   kioskId?: string | null;
-  descriptor?: number[] | null;
+  frames?: string[] | null;
   livenessPassed?: boolean | null;
   livenessPrompt?: string | null;
   faceCount?: number | null;
@@ -528,20 +724,30 @@ export async function verifyFaceAndRecordKioskPunch(input: {
     employeeIdForAudit = context.data.employee.employeeId;
     punchTypeForAudit = context.data.nextPunch;
 
-    const descriptor = normalizeDescriptor(input.descriptor);
-    const faceCount =
-      typeof input.faceCount === "number" && Number.isFinite(input.faceCount)
-        ? Math.max(0, Math.round(input.faceCount))
-        : descriptor
-          ? 1
-          : 0;
-    const modelVersion = normalizeModelVersion(input.modelVersion);
+    const frames = normalizeFaceFrames(input.frames, 18);
+    if (frames.length === 0) {
+      return {
+        success: false,
+        error: "Face frames are required before punching.",
+        reason: "missing_face_frames",
+      };
+    }
+    const embeddedFace = await embedFaceFrames({
+      frames,
+      purpose: "verification",
+      requireFrontFace: true,
+    });
+    const descriptor = embeddedFace.embedding;
+    const faceCount = embeddedFace.faceCount;
+    const modelVersion = normalizeModelVersion(embeddedFace.modelVersion);
     const livenessPrompt =
       typeof input.livenessPrompt === "string" && input.livenessPrompt.trim()
         ? input.livenessPrompt.trim().slice(0, 191)
         : null;
     const faceMetadata = {
-      source: "browser-face-api",
+      source: "python-insightface",
+      frameCount: frames.length,
+      quality: embeddedFace.quality,
       ...(typeof input.faceMetadata === "object" && input.faceMetadata
         ? (input.faceMetadata as Record<string, unknown>)
         : {}),
@@ -550,20 +756,25 @@ export async function verifyFaceAndRecordKioskPunch(input: {
     const activeEnrollments = await db.employeeFaceEnrollment.findMany({
       where: { employeeId: context.data.employee.employeeId, isActive: true },
       orderBy: { createdAt: "desc" },
-      select: { embedding: true },
+      select: { embedding: true, modelVersion: true },
       take: 3,
     });
-    if (activeEnrollments.length === 0) {
+    const activeInsightFaceEnrollments = activeEnrollments.filter((enrollment) =>
+      isInsightFaceModel(enrollment.modelVersion),
+    );
+    if (activeInsightFaceEnrollments.length === 0) {
       await logFaceAttempt({
         employeeId: context.data.employee.employeeId,
         kioskId: input.kioskId ?? null,
         punchType: context.data.nextPunch,
         status: "FAILED",
-        reason: "no_active_face_enrollment",
+        reason: "no_active_insightface_enrollment",
+        modelVersion,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
       });
       return {
         success: false,
-        error: "No active face enrollment found. Ask a manager to enroll your face.",
+        error: "Python face enrollment required. Ask a manager to re-enroll your face.",
         reason: "no_face_enrollment",
       };
     }
@@ -579,6 +790,7 @@ export async function verifyFaceAndRecordKioskPunch(input: {
         livenessPrompt,
         faceCount,
         modelVersion,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
         details: faceMetadata,
       });
       return {
@@ -588,26 +800,6 @@ export async function verifyFaceAndRecordKioskPunch(input: {
             ? "No face detected. Please retry."
             : "Multiple faces detected. Only one employee may be in frame.",
         reason: faceCount === 0 ? "no_face_detected" : "multiple_faces",
-      };
-    }
-
-    if (!descriptor) {
-      await logFaceAttempt({
-        employeeId: context.data.employee.employeeId,
-        kioskId: input.kioskId ?? null,
-        punchType: context.data.nextPunch,
-        status: "FAILED",
-        reason: "missing_face_descriptor",
-        livenessPassed: Boolean(input.livenessPassed),
-        livenessPrompt,
-        faceCount,
-        modelVersion,
-        details: faceMetadata,
-      });
-      return {
-        success: false,
-        error: "Face descriptor is required before punching.",
-        reason: "missing_face_descriptor",
       };
     }
 
@@ -622,6 +814,7 @@ export async function verifyFaceAndRecordKioskPunch(input: {
         livenessPrompt,
         faceCount,
         modelVersion,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
         details: faceMetadata,
       });
       return {
@@ -632,30 +825,39 @@ export async function verifyFaceAndRecordKioskPunch(input: {
     }
 
     const threshold = Number(settings.faceMatchMaxDistance);
-    const distances = activeEnrollments.map((enrollment) =>
-      faceDistance(decryptFaceEmbedding(enrollment.embedding), descriptor),
-    );
-    const bestDistance = Math.min(...distances);
+    const faceMatch = await evaluateFaceMatch({
+      employeeId: context.data.employee.employeeId,
+      descriptor,
+      activeEnrollments: activeInsightFaceEnrollments,
+      threshold,
+    });
 
-    if (!Number.isFinite(bestDistance) || bestDistance > threshold) {
+    if (!faceMatch.success) {
       await logFaceAttempt({
         employeeId: context.data.employee.employeeId,
         kioskId: input.kioskId ?? null,
         punchType: context.data.nextPunch,
         status: "FAILED",
-        reason: "face_mismatch",
-        distance: Number.isFinite(bestDistance) ? bestDistance : null,
+        reason: faceMatch.reason,
+        distance: faceMatch.bestDistance,
         threshold,
         livenessPassed: Boolean(input.livenessPassed),
         livenessPrompt,
         faceCount,
         modelVersion,
-        details: faceMetadata,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
+        details: {
+          ...faceMetadata,
+          ambiguityMargin: FACE_MATCH_AMBIGUITY_MARGIN,
+          nearestOtherEmployeeId: faceMatch.nearestOther?.employeeId ?? null,
+          nearestOtherEnrollmentId: faceMatch.nearestOther?.enrollmentId ?? null,
+          nearestOtherDistance: faceMatch.nearestOther?.distance ?? null,
+        },
       });
       return {
         success: false,
-        error: "Face did not match enrolled employee.",
-        reason: "face_mismatch",
+        error: faceMatch.error,
+        reason: faceMatch.reason,
       };
     }
 
@@ -668,7 +870,8 @@ export async function verifyFaceAndRecordKioskPunch(input: {
     });
 
     const securityResult = punch.attendance?.id
-      ? await captureAttendanceSecurityEvent({
+        ? await captureAttendanceSecurityEvent({
+          punchId: punch.punch.id,
           attendanceId: punch.attendance.id,
           employeeId: context.data.employee.employeeId,
           punchTime: context.data.now,
@@ -688,15 +891,20 @@ export async function verifyFaceAndRecordKioskPunch(input: {
       punchType: context.data.nextPunch,
       status: "PASSED",
       reason: "face_match",
-      distance: bestDistance,
+      distance: faceMatch.bestDistance,
       threshold,
       livenessPassed: Boolean(input.livenessPassed),
       livenessPrompt,
       faceCount,
       modelVersion,
+      serviceLatencyMs: embeddedFace.serviceLatencyMs,
       details: {
         ...faceMetadata,
         contextLogId: securityResult?.contextLogId ?? null,
+        ambiguityMargin: FACE_MATCH_AMBIGUITY_MARGIN,
+        nearestOtherEmployeeId: faceMatch.nearestOther?.employeeId ?? null,
+        nearestOtherEnrollmentId: faceMatch.nearestOther?.enrollmentId ?? null,
+        nearestOtherDistance: faceMatch.nearestOther?.distance ?? null,
       },
     });
 
@@ -712,20 +920,24 @@ export async function verifyFaceAndRecordKioskPunch(input: {
         ...buildPunchSuccessPayload(context.data, punch.punch),
         ...serializePunch(punch.punch),
         faceVerified: true,
-        faceDistance: bestDistance,
+        faceDistance: faceMatch.bestDistance,
         faceThreshold: threshold,
         livenessPassed: Boolean(input.livenessPassed),
       },
     };
   } catch (error) {
     console.error("Failed to verify face and record kiosk punch", error);
+    const reason =
+      error instanceof FaceServiceError
+        ? error.reason
+        : "face_verification_error";
     if (employeeIdForAudit) {
       await logFaceAttempt({
         employeeId: employeeIdForAudit,
         kioskId: input.kioskId ?? null,
         punchType: punchTypeForAudit,
         status: "ERROR",
-        reason: error instanceof Error ? error.message : "face_verification_error",
+        reason: error instanceof Error ? error.message : reason,
       }).catch(() => null);
     }
     return {
@@ -734,7 +946,7 @@ export async function verifyFaceAndRecordKioskPunch(input: {
         error instanceof Error
           ? error.message
           : "Face verification failed. Use supervisor fallback if needed.",
-      reason: "face_verification_error",
+      reason,
     };
   }
 }
@@ -744,7 +956,7 @@ export async function verifyFaceAndRecordQrPunch(input: {
   kioskId?: string | null;
   nonce?: string | null;
   exp?: number | null;
-  descriptor?: number[] | null;
+  frames?: string[] | null;
   livenessPassed?: boolean | null;
   livenessPrompt?: string | null;
   faceCount?: number | null;
@@ -815,20 +1027,30 @@ export async function verifyFaceAndRecordQrPunch(input: {
       };
     }
 
-    const descriptor = normalizeDescriptor(input.descriptor);
-    const faceCount =
-      typeof input.faceCount === "number" && Number.isFinite(input.faceCount)
-        ? Math.max(0, Math.round(input.faceCount))
-        : descriptor
-          ? 1
-          : 0;
-    const modelVersion = normalizeModelVersion(input.modelVersion);
+    const frames = normalizeFaceFrames(input.frames, 18);
+    if (frames.length === 0) {
+      return {
+        success: false,
+        error: "Face frames are required before punching.",
+        reason: "missing_face_frames",
+      };
+    }
+    const embeddedFace = await embedFaceFrames({
+      frames,
+      purpose: "verification",
+      requireFrontFace: true,
+    });
+    const descriptor = embeddedFace.embedding;
+    const faceCount = embeddedFace.faceCount;
+    const modelVersion = normalizeModelVersion(embeddedFace.modelVersion);
     const livenessPrompt =
       typeof input.livenessPrompt === "string" && input.livenessPrompt.trim()
         ? input.livenessPrompt.trim().slice(0, 191)
         : null;
     const faceMetadata = {
-      source: "browser-face-api",
+      source: "python-insightface",
+      frameCount: frames.length,
+      quality: embeddedFace.quality,
       ...(typeof input.faceMetadata === "object" && input.faceMetadata
         ? (input.faceMetadata as Record<string, unknown>)
         : {}),
@@ -917,21 +1139,26 @@ export async function verifyFaceAndRecordQrPunch(input: {
     const activeEnrollments = await db.employeeFaceEnrollment.findMany({
       where: { employeeId: employee.employeeId, isActive: true },
       orderBy: { createdAt: "desc" },
-      select: { embedding: true },
+      select: { embedding: true, modelVersion: true },
       take: 3,
     });
-    if (activeEnrollments.length === 0) {
+    const activeInsightFaceEnrollments = activeEnrollments.filter((enrollment) =>
+      isInsightFaceModel(enrollment.modelVersion),
+    );
+    if (activeInsightFaceEnrollments.length === 0) {
       await logFaceAttempt({
         employeeId: employee.employeeId,
         kioskId: input.kioskId ?? null,
         kioskNonce: input.nonce ?? null,
         punchType: punchType as PUNCH_TYPE,
         status: "FAILED",
-        reason: "no_active_face_enrollment",
+        reason: "no_active_insightface_enrollment",
+        modelVersion,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
       });
       return {
         success: false,
-        error: "No active face enrollment found. Ask a manager to enroll your face.",
+        error: "Python face enrollment required. Ask a manager to re-enroll your face.",
         reason: "no_face_enrollment",
       };
     }
@@ -948,6 +1175,7 @@ export async function verifyFaceAndRecordQrPunch(input: {
         livenessPrompt,
         faceCount,
         modelVersion,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
         details: faceMetadata,
       });
       return {
@@ -957,27 +1185,6 @@ export async function verifyFaceAndRecordQrPunch(input: {
             ? "No face detected. Please retry."
             : "Multiple faces detected. Only one employee may be in frame.",
         reason: faceCount === 0 ? "no_face_detected" : "multiple_faces",
-      };
-    }
-
-    if (!descriptor) {
-      await logFaceAttempt({
-        employeeId: employee.employeeId,
-        kioskId: input.kioskId ?? null,
-        kioskNonce: input.nonce ?? null,
-        punchType: punchType as PUNCH_TYPE,
-        status: "FAILED",
-        reason: "missing_face_descriptor",
-        livenessPassed: Boolean(input.livenessPassed),
-        livenessPrompt,
-        faceCount,
-        modelVersion,
-        details: faceMetadata,
-      });
-      return {
-        success: false,
-        error: "Face descriptor is required before punching.",
-        reason: "missing_face_descriptor",
       };
     }
 
@@ -993,6 +1200,7 @@ export async function verifyFaceAndRecordQrPunch(input: {
         livenessPrompt,
         faceCount,
         modelVersion,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
         details: faceMetadata,
       });
       return {
@@ -1003,31 +1211,40 @@ export async function verifyFaceAndRecordQrPunch(input: {
     }
 
     const threshold = Number(settings.faceMatchMaxDistance);
-    const distances = activeEnrollments.map((enrollment) =>
-      faceDistance(decryptFaceEmbedding(enrollment.embedding), descriptor),
-    );
-    const bestDistance = Math.min(...distances);
+    const faceMatch = await evaluateFaceMatch({
+      employeeId: employee.employeeId,
+      descriptor,
+      activeEnrollments: activeInsightFaceEnrollments,
+      threshold,
+    });
 
-    if (!Number.isFinite(bestDistance) || bestDistance > threshold) {
+    if (!faceMatch.success) {
       await logFaceAttempt({
         employeeId: employee.employeeId,
         kioskId: input.kioskId ?? null,
         kioskNonce: input.nonce ?? null,
         punchType: punchType as PUNCH_TYPE,
         status: "FAILED",
-        reason: "face_mismatch",
-        distance: Number.isFinite(bestDistance) ? bestDistance : null,
+        reason: faceMatch.reason,
+        distance: faceMatch.bestDistance,
         threshold,
         livenessPassed: Boolean(input.livenessPassed),
         livenessPrompt,
         faceCount,
         modelVersion,
-        details: faceMetadata,
+        serviceLatencyMs: embeddedFace.serviceLatencyMs,
+        details: {
+          ...faceMetadata,
+          ambiguityMargin: FACE_MATCH_AMBIGUITY_MARGIN,
+          nearestOtherEmployeeId: faceMatch.nearestOther?.employeeId ?? null,
+          nearestOtherEnrollmentId: faceMatch.nearestOther?.enrollmentId ?? null,
+          nearestOtherDistance: faceMatch.nearestOther?.distance ?? null,
+        },
       });
       return {
         success: false,
-        error: "Face did not match enrolled employee.",
-        reason: "face_mismatch",
+        error: faceMatch.error,
+        reason: faceMatch.reason,
       };
     }
 
@@ -1040,7 +1257,8 @@ export async function verifyFaceAndRecordQrPunch(input: {
     });
 
     const securityResult = punch.attendance?.id
-      ? await captureAttendanceSecurityEvent({
+        ? await captureAttendanceSecurityEvent({
+          punchId: punch.punch.id,
           attendanceId: punch.attendance.id,
           employeeId: employee.employeeId,
           punchTime: now,
@@ -1061,16 +1279,21 @@ export async function verifyFaceAndRecordQrPunch(input: {
       punchType: punchType as PUNCH_TYPE,
       status: "PASSED",
       reason: "face_match",
-      distance: bestDistance,
+      distance: faceMatch.bestDistance,
       threshold,
       livenessPassed: Boolean(input.livenessPassed),
       livenessPrompt,
       faceCount,
       modelVersion,
+      serviceLatencyMs: embeddedFace.serviceLatencyMs,
       details: {
         ...faceMetadata,
         contextLogId: securityResult?.contextLogId ?? null,
         breakStats: computeBreakStats([...punchesToday, punch.punch]),
+        ambiguityMargin: FACE_MATCH_AMBIGUITY_MARGIN,
+        nearestOtherEmployeeId: faceMatch.nearestOther?.employeeId ?? null,
+        nearestOtherEnrollmentId: faceMatch.nearestOther?.enrollmentId ?? null,
+        nearestOtherDistance: faceMatch.nearestOther?.distance ?? null,
       },
     });
 
@@ -1085,13 +1308,17 @@ export async function verifyFaceAndRecordQrPunch(input: {
       data: {
         ...serializePunch(punch.punch),
         faceVerified: true,
-        faceDistance: bestDistance,
+        faceDistance: faceMatch.bestDistance,
         faceThreshold: threshold,
         livenessPassed: Boolean(input.livenessPassed),
       },
     };
   } catch (error) {
     console.error("Failed to verify face and record QR punch", error);
+    const reason =
+      error instanceof FaceServiceError
+        ? error.reason
+        : "face_verification_error";
     if (employeeIdForAudit) {
       await logFaceAttempt({
         employeeId: employeeIdForAudit,
@@ -1099,7 +1326,7 @@ export async function verifyFaceAndRecordQrPunch(input: {
         kioskNonce: input.nonce ?? null,
         punchType: punchTypeForAudit,
         status: "ERROR",
-        reason: error instanceof Error ? error.message : "face_verification_error",
+        reason: error instanceof Error ? error.message : reason,
       }).catch(() => null);
     }
     return {
@@ -1108,7 +1335,7 @@ export async function verifyFaceAndRecordQrPunch(input: {
         error instanceof Error
           ? error.message
           : "Face verification failed. Use supervisor fallback if needed.",
-      reason: "face_verification_error",
+      reason,
     };
   }
 }

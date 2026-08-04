@@ -19,10 +19,9 @@ import {
 import { InlineLoadingState } from "@/components/loading/loading-states";
 import { useToast } from "@/components/ui/toast-provider";
 import {
-  captureFaceDescriptor,
-  loadFaceApiModels,
-  type FaceApiDescriptorResult,
-} from "@/lib/face-api-client";
+  FaceCaptureClientError,
+  captureFrontFaceFrames,
+} from "@/lib/face-capture-client";
 
 type FaceEnrollmentRow = {
   id: string;
@@ -56,35 +55,39 @@ type FaceAttemptRow = {
 
 const REQUIRED_SAMPLES = 3;
 const MAX_SAMPLES = 5;
-const MIN_DETECTION_SCORE = 0.52;
-const MIN_FACE_BOX_RATIO = 0.16;
-const MAX_FACE_BOX_RATIO = 0.72;
+
+type EnrollmentMode = "add" | "replace";
 
 const enrollmentSteps = [
   {
+    id: "center",
     label: "Center",
     prompt: "CENTER FACE",
     hint: "Look straight at the camera.",
   },
   {
-    label: "Left",
-    prompt: "TURN LEFT",
-    hint: "Turn your head slightly left.",
+    id: "hold-front",
+    label: "Hold",
+    prompt: "HOLD STILL",
+    hint: "Keep facing the camera.",
   },
   {
-    label: "Right",
-    prompt: "TURN RIGHT",
-    hint: "Turn your head slightly right.",
-  },
-  {
+    id: "blink",
     label: "Blink",
     prompt: "BLINK ONCE",
-    hint: "Blink once, then hold still.",
+    hint: "Blink once while facing forward.",
   },
   {
-    label: "Finish",
+    id: "hold-centered",
+    label: "Hold",
     prompt: "HOLD STILL",
-    hint: "Look straight again for the final sample.",
+    hint: "Keep your face centered.",
+  },
+  {
+    id: "final-front",
+    label: "Finish",
+    prompt: "FINAL FRONT FACE",
+    hint: "Look straight for the final sample.",
   },
 ] as const;
 
@@ -103,67 +106,6 @@ const formatDateTime = (value?: string | null) => {
   });
 };
 
-const getSampleReadiness = (
-  sample: FaceApiDescriptorResult,
-  stepIndex = 0,
-) => {
-  const { detectionScore, faceBoxRatio, yawRatio } = sample.metadata;
-
-  if (detectionScore < MIN_DETECTION_SCORE) {
-    return {
-      ready: false,
-      message: "Need brighter light",
-      detail: `Face score ${detectionScore.toFixed(2)}`,
-    };
-  }
-
-  if (faceBoxRatio < MIN_FACE_BOX_RATIO) {
-    return {
-      ready: false,
-      message: "Move closer",
-      detail: "Face is too small in frame",
-    };
-  }
-
-  if (faceBoxRatio > MAX_FACE_BOX_RATIO) {
-    return {
-      ready: false,
-      message: "Move back a little",
-      detail: "Face is too close to camera",
-    };
-  }
-
-  if (stepIndex === 1 && (yawRatio == null || yawRatio < 0.05)) {
-    return {
-      ready: false,
-      message: "Turn left a little more",
-      detail: "Pose sample needs a slight left turn",
-    };
-  }
-
-  if (stepIndex === 2 && (yawRatio == null || yawRatio > -0.05)) {
-    return {
-      ready: false,
-      message: "Turn right a little more",
-      detail: "Pose sample needs a slight right turn",
-    };
-  }
-
-  if (stepIndex >= 4 && yawRatio != null && Math.abs(yawRatio) > 0.12) {
-    return {
-      ready: false,
-      message: "Look straight again",
-      detail: "Final sample should face the camera",
-    };
-  }
-
-  return {
-    ready: true,
-    message: "Good frame",
-    detail: `Face score ${detectionScore.toFixed(2)}`,
-  };
-};
-
 export function EmployeeFaceEnrollmentCard({
   employeeId,
 }: {
@@ -176,10 +118,7 @@ export function EmployeeFaceEnrollmentCard({
   const lastAutoCaptureAtRef = useRef(0);
   const [rows, setRows] = useState<FaceEnrollmentRow[]>([]);
   const [attempts, setAttempts] = useState<FaceAttemptRow[]>([]);
-  const [samples, setSamples] = useState<FaceApiDescriptorResult[]>([]);
-  const [lastPreview, setLastPreview] = useState<FaceApiDescriptorResult | null>(
-    null,
-  );
+  const [samples, setSamples] = useState<string[]>([]);
   const [liveFeedback, setLiveFeedback] = useState(
     "Open camera and center one face.",
   );
@@ -192,27 +131,18 @@ export function EmployeeFaceEnrollmentCard({
   const [modelsReady, setModelsReady] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [enrollmentMode, setEnrollmentMode] =
+    useState<EnrollmentMode>("replace");
   const [error, setError] = useState<string | null>(null);
 
-  const activeEnrollment = rows.find((row) => row.isActive) ?? null;
+  const activeEnrollments = rows.filter((row) => row.isActive);
+  const activeEnrollment = activeEnrollments[0] ?? null;
   const currentStep =
     enrollmentSteps[Math.min(samples.length, enrollmentSteps.length - 1)];
   const progressPercent = Math.min(
     100,
     Math.round((samples.length / REQUIRED_SAMPLES) * 100),
   );
-  const latestScore = lastPreview?.metadata.detectionScore;
-  const latestFaceSize = lastPreview?.metadata.faceBoxRatio;
-  const latestYaw = lastPreview?.metadata.yawRatio;
-  const poseLabel =
-    latestYaw == null
-      ? "Waiting"
-      : latestYaw > 0.08
-        ? "Left turn"
-        : latestYaw < -0.08
-          ? "Right turn"
-          : "Straight";
-
   const load = async () => {
     try {
       setLoading(true);
@@ -246,7 +176,6 @@ export function EmployeeFaceEnrollmentCard({
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-    setLastPreview(null);
     setLiveFeedback("Open camera and center one face.");
     setCapturePulse(false);
     autoCaptureBusyRef.current = false;
@@ -255,23 +184,21 @@ export function EmployeeFaceEnrollmentCard({
     setCameraOpen(false);
   };
 
-  const startCamera = async () => {
+  const startCamera = async (mode: EnrollmentMode = "replace") => {
     try {
       setError(null);
+      setEnrollmentMode(mode);
       setSamples([]);
-      setLastPreview(null);
-      setLiveFeedback("Loading face models...");
+      setLiveFeedback("Starting camera...");
       setCapturePulse(false);
       autoCaptureBusyRef.current = false;
       lastAutoCaptureAtRef.current = 0;
       setCameraReady(false);
-      setModelsReady(false);
+      setModelsReady(true);
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       setCameraStream(null);
       setCameraOpen(true);
-      await loadFaceApiModels();
-      setModelsReady(true);
       setLiveFeedback("Allow camera, then center one face.");
       if (
         typeof navigator === "undefined" ||
@@ -308,14 +235,10 @@ export function EmployeeFaceEnrollmentCard({
     try {
       setCapturing(true);
       setError(null);
-      const sample = await captureFaceDescriptor(video);
-      const readiness = getSampleReadiness(sample, samples.length);
-      setLastPreview(sample);
-      setLiveFeedback(readiness.ready ? "Sample saved" : readiness.message);
-      if (!readiness.ready) {
-        setError(readiness.detail);
-        return;
-      }
+      const capture = await captureFrontFaceFrames(video, { frameCount: 1 });
+      const sample = capture.frames[0];
+      if (!sample) throw new Error("Face sample could not be captured.");
+      setLiveFeedback("Sample saved");
       setSamples((current) =>
         current.length >= MAX_SAMPLES ? current : [...current, sample],
       );
@@ -323,9 +246,7 @@ export function EmployeeFaceEnrollmentCard({
       window.setTimeout(() => setCapturePulse(false), 280);
     } catch (err) {
       setError(
-        err instanceof Error
-          ? err.message
-          : "Face sample could not be captured.",
+        err instanceof Error ? err.message : "Face sample could not be captured.",
       );
       setLiveFeedback("Face not ready");
     } finally {
@@ -339,17 +260,21 @@ export function EmployeeFaceEnrollmentCard({
       setError(null);
       const result = await enrollEmployeeFace({
         employeeId,
-        descriptors: samples.map((sample) => sample.descriptor),
-        modelVersion: samples[0]?.modelVersion ?? null,
-        descriptorMetadata: {
-          samples: samples.map((sample) => sample.metadata),
+        frames: samples,
+        faceMetadata: {
+          source: "browser-frame-capture",
+          sampleCount: samples.length,
         },
+        replaceExisting: enrollmentMode === "replace",
       });
       if (!result.success) {
         throw new Error(result.error || "Failed to enroll face");
       }
       toast.success("Face enrollment saved.", {
-        description: "Encrypted face template is now active for QR punches.",
+        description:
+          enrollmentMode === "replace"
+            ? "Encrypted face template replaced existing active templates."
+            : "Encrypted face variant is now active for QR punches.",
       });
       stopCamera();
       setSamples([]);
@@ -468,17 +393,17 @@ export function EmployeeFaceEnrollmentCard({
       autoCaptureBusyRef.current = true;
 
       try {
-        const sample = await captureFaceDescriptor(video);
+        const capture = await captureFrontFaceFrames(video, { frameCount: 1 });
         if (cancelled) return;
-
-        const readiness = getSampleReadiness(sample, samples.length);
-        setLastPreview(sample);
-        setLiveFeedback(
-          readiness.ready ? `${currentStep.hint} Hold still...` : readiness.message,
+        const sample = capture.frames[0];
+        if (!sample) throw new FaceCaptureClientError(
+          "Camera frame could not be captured.",
+          "frame_capture_failed",
         );
 
+        setLiveFeedback(`${currentStep.hint} Hold still...`);
+
         if (
-          readiness.ready &&
           Date.now() - lastAutoCaptureAtRef.current > 1600
         ) {
           lastAutoCaptureAtRef.current = Date.now();
@@ -498,7 +423,6 @@ export function EmployeeFaceEnrollmentCard({
         }
       } catch (err) {
         if (cancelled) return;
-        setLastPreview(null);
         setLiveFeedback(
           err instanceof Error ? err.message : "Center one face in frame.",
         );
@@ -553,9 +477,11 @@ export function EmployeeFaceEnrollmentCard({
         ) : (
           <div className="rounded-lg border bg-background/60 p-3 text-sm">
             <p>
-              <span className="font-medium">Active enrollment:</span>{" "}
-              {activeEnrollment
-                ? `${activeEnrollment.sampleCount} samples, ${activeEnrollment.modelVersion}`
+              <span className="font-medium">Active enrollments:</span>{" "}
+              {activeEnrollments.length > 0
+                ? `${activeEnrollments.length} active template${
+                    activeEnrollments.length === 1 ? "" : "s"
+                  }, latest has ${activeEnrollment?.sampleCount ?? 0} samples`
                 : "None"}
             </p>
             <p className="text-muted-foreground">
@@ -575,7 +501,7 @@ export function EmployeeFaceEnrollmentCard({
                     capturePulse ? "ring-emerald-400" : "ring-border/60"
                   }`}
                 >
-                  <div className="pointer-events-none absolute inset-x-3 top-3 z-10 rounded-lg bg-black/75 px-3 py-3 text-center text-xl font-bold tracking-wide text-white">
+                  <div className="pointer-events-none absolute inset-x-3 top-3 z-20 rounded-lg bg-black/75 px-3 py-3 text-center text-xl font-bold tracking-wide text-white">
                     {currentStep.prompt}
                   </div>
                   <video
@@ -585,12 +511,22 @@ export function EmployeeFaceEnrollmentCard({
                     playsInline
                     muted
                   />
-                  <div className="pointer-events-none absolute inset-x-4 bottom-4 z-10 rounded-lg bg-background/90 px-3 py-2 text-center text-sm font-medium text-foreground">
+                  <div
+                    aria-hidden="true"
+                    className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center"
+                  >
+                    <div className="relative h-[62%] w-[52%] rounded-[50%] border-2 border-white/80 shadow-[0_0_0_999px_rgba(0,0,0,0.28)]">
+                      <div className="absolute left-[18%] right-[18%] top-[38%] border-t border-white/70" />
+                      <div className="absolute bottom-[18%] left-1/2 top-[18%] border-l border-white/35" />
+                      <div className="absolute -bottom-[18%] left-1/2 h-[22%] w-[78%] -translate-x-1/2 rounded-t-full border-t border-white/50" />
+                    </div>
+                  </div>
+                  <div className="pointer-events-none absolute inset-x-4 bottom-4 z-20 rounded-lg bg-background/90 px-3 py-2 text-center text-sm font-medium text-foreground">
                     {liveFeedback}
                   </div>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Auto-capture stores descriptors only. Raw photos are not saved.
+                  Auto-capture sends temporary frames to the local Python face service. Raw photos are not saved.
                 </p>
               </div>
 
@@ -620,7 +556,7 @@ export function EmployeeFaceEnrollmentCard({
                     const active = samples.length === index;
                     return (
                       <div
-                        key={step.label}
+                        key={step.id}
                         className={`rounded-lg border px-3 py-2 text-sm transition ${
                           done
                             ? "border-emerald-500/60 bg-emerald-500/10"
@@ -640,28 +576,22 @@ export function EmployeeFaceEnrollmentCard({
 
                 <div className="grid gap-2 sm:grid-cols-3">
                   <div className="rounded-lg border bg-background/60 px-3 py-2 text-sm">
-                    <p className="text-xs text-muted-foreground">Models</p>
+                    <p className="text-xs text-muted-foreground">Capture</p>
                     <p className="font-medium">
-                      {modelsReady ? "Loaded" : "Loading..."}
+                      {modelsReady ? "Ready" : "Starting..."}
                     </p>
                   </div>
                   <div className="rounded-lg border bg-background/60 px-3 py-2 text-sm">
-                    <p className="text-xs text-muted-foreground">Face score</p>
-                    <p className="font-medium">
-                      {latestScore != null ? latestScore.toFixed(2) : "Waiting"}
-                    </p>
+                    <p className="text-xs text-muted-foreground">Validator</p>
+                    <p className="font-medium">Python service</p>
                   </div>
                   <div className="rounded-lg border bg-background/60 px-3 py-2 text-sm">
                     <p className="text-xs text-muted-foreground">Pose</p>
-                    <p className="font-medium">{poseLabel}</p>
+                    <p className="font-medium">Use face guide</p>
                   </div>
                   <div className="rounded-lg border bg-background/60 px-3 py-2 text-sm sm:col-span-3">
                     <p className="text-xs text-muted-foreground">Face size</p>
-                    <p className="font-medium">
-                      {latestFaceSize != null
-                        ? `${Math.round(latestFaceSize * 100)}% of frame`
-                        : "Waiting for face"}
-                    </p>
+                    <p className="font-medium">Fit face inside the oval</p>
                   </div>
                 </div>
               </div>
@@ -697,7 +627,11 @@ export function EmployeeFaceEnrollmentCard({
                 onClick={() => void submitEnrollment()}
                 disabled={samples.length < REQUIRED_SAMPLES || saving}
               >
-                {saving ? "Saving..." : "Save enrollment"}
+                {saving
+                  ? "Saving..."
+                  : enrollmentMode === "replace"
+                    ? "Replace all templates"
+                    : "Save appearance variant"}
               </Button>
               {samples.length > 0 ? (
                 <Button
@@ -705,7 +639,6 @@ export function EmployeeFaceEnrollmentCard({
                   variant="outline"
                   onClick={() => {
                     setSamples([]);
-                    setLastPreview(null);
                     setLiveFeedback("Samples cleared. Center one face.");
                   }}
                   disabled={saving}
@@ -725,9 +658,24 @@ export function EmployeeFaceEnrollmentCard({
           </div>
         ) : (
           <div className="flex flex-wrap gap-2">
-            <Button type="button" onClick={() => void startCamera()}>
-              {activeEnrollment ? "Re-enroll face" : "Enroll face"}
+            <Button
+              type="button"
+              onClick={() =>
+                void startCamera(activeEnrollment ? "add" : "replace")
+              }
+            >
+              {activeEnrollment ? "Add appearance variant" : "Enroll front face"}
             </Button>
+            {activeEnrollment ? (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void startCamera("replace")}
+                disabled={saving}
+              >
+                Replace all templates
+              </Button>
+            ) : null}
             {activeEnrollment ? (
               <Button
                 type="button"
@@ -735,7 +683,7 @@ export function EmployeeFaceEnrollmentCard({
                 onClick={() => void revokeActiveEnrollment()}
                 disabled={saving}
               >
-                Revoke enrollment
+                Revoke latest enrollment
               </Button>
             ) : null}
           </div>
@@ -765,7 +713,11 @@ export function EmployeeFaceEnrollmentCard({
                   </div>
                   <div className="text-xs text-muted-foreground">
                     {attempt.distance != null
-                      ? `Distance ${attempt.distance.toFixed(3)}`
+                      ? `Distance ${attempt.distance.toFixed(3)}${
+                          attempt.threshold != null
+                            ? ` / threshold ${attempt.threshold.toFixed(2)}`
+                            : ""
+                        }`
                       : "No score"}
                   </div>
                 </div>

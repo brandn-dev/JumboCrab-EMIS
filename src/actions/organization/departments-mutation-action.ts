@@ -6,12 +6,16 @@ import {
   isArchivedTokenName,
   resolveDepartmentRestoreName,
 } from "./departments-shared";
+import { requireOrganizationMutationAccess } from "./organization-auth";
 
 export async function archiveDepartment(departmentId: string): Promise<{
   success: boolean;
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const id = typeof departmentId === "string" ? departmentId.trim() : "";
     if (!id) {
       return { success: false, error: "Department ID is required" };
@@ -56,6 +60,9 @@ export async function unarchiveDepartment(departmentId: string): Promise<{
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const id = typeof departmentId === "string" ? departmentId.trim() : "";
     if (!id) {
       return { success: false, error: "Department ID is required" };
@@ -101,6 +108,9 @@ export async function createDepartment(input: {
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const name = typeof input.name === "string" ? input.name.trim() : "";
     const description =
       typeof input.description === "string" ? input.description.trim() : null;
@@ -139,6 +149,9 @@ export async function updateDepartment(input: {
   error?: string;
 }> {
   try {
+    const authError = await requireOrganizationMutationAccess();
+    if (authError) return authError;
+
     const departmentId =
       typeof input.departmentId === "string" ? input.departmentId.trim() : "";
     const name = typeof input.name === "string" ? input.name.trim() : "";
