@@ -161,6 +161,8 @@ model Employee {
   punches                      Punch[]
   faceEnrollments              EmployeeFaceEnrollment[]
   faceVerificationAttempts     FaceVerificationAttempt[]
+  attendanceFaceChallenges     AttendanceFaceChallenge[]
+  attendanceQrRedemptions      AttendanceQrRedemption[]
   employeeViolations           EmployeeViolation[]
   violationResets              EmployeeViolationReset[]
   violationAutoResetPolicies   ViolationAutoResetPolicy[]
@@ -487,6 +489,8 @@ model Punch {
   employee                 Employee                  @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
   attendance               Attendance?               @relation(fields: [attendanceId], references: [id])
   faceVerificationAttempts FaceVerificationAttempt[]
+  attendanceFaceChallenge  AttendanceFaceChallenge?
+  attendanceQrRedemption   AttendanceQrRedemption?
 
   @@index([employeeId, punchTime])
   @@index([punchTime])
@@ -502,6 +506,18 @@ model AttendanceSecuritySetting {
   faceLivenessRequired   Boolean  @default(true)
   faceMatchMaxDistance   Decimal  @default(0.35) @db.Decimal(4, 2)
   faceFailureMode        String   @default("BLOCK")
+  activeFaceChallengeRequired       Boolean @default(true)
+  identityContinuityRequired        Boolean @default(true)
+  passiveAntiSpoofRequired          Boolean @default(false)
+  faceChallengeExpiresSeconds       Int     @default(20)
+  faceChallengeActionCount          Int     @default(2)
+  faceChallengeMaxFrames            Int     @default(24)
+  faceChallengeMaxPayloadBytes      Int     @default(1250000)
+  faceChallengeMaxAttemptsPerMinute Int     @default(5)
+  faceChallengeMaxFailures          Int     @default(3)
+  faceChallengeCooldownSeconds      Int     @default(60)
+  faceContinuityFrameCount          Int     @default(5)
+  faceContinuityMaxDistance         Decimal @default(0.35) @db.Decimal(4, 2)
   updatedByUserId        String?
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
@@ -541,6 +557,7 @@ model FaceVerificationAttempt {
   employeeId       String
   attendanceId     String?
   punchId          String?
+  challengeId      String?
   kioskId          String?
   kioskNonce       String?
   punchType        PUNCH_TYPE?
@@ -559,12 +576,62 @@ model FaceVerificationAttempt {
   employee   Employee    @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
   attendance Attendance? @relation(fields: [attendanceId], references: [id], onDelete: SetNull)
   punch      Punch?      @relation(fields: [punchId], references: [id], onDelete: SetNull)
+  challenge  AttendanceFaceChallenge? @relation(fields: [challengeId], references: [id], onDelete: SetNull)
 
   @@index([employeeId, createdAt])
   @@index([attendanceId])
   @@index([punchId])
+  @@index([challengeId])
   @@index([status, createdAt])
   @@index([kioskId, createdAt])
+}
+
+model AttendanceFaceChallenge {
+  id                    String                        @id @default(cuid())
+  employeeId            String
+  punchId               String?                       @unique
+  kioskId               String
+  kioskBindingHash      String
+  nonceHash             String
+  actions               Json
+  expectedPunchType     PUNCH_TYPE
+  status                AttendanceFaceChallengeStatus @default(PENDING)
+  expiresAt             DateTime
+  processingStartedAt   DateTime?
+  usedAt                DateTime?
+  failureReason         String?
+  frameSequenceHash     String?                       @unique
+  details               Json?
+  createdAt             DateTime                      @default(now())
+  updatedAt             DateTime                      @updatedAt
+
+  employee              Employee                      @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  punch                 Punch?                        @relation(fields: [punchId], references: [id], onDelete: SetNull)
+  qrRedemption          AttendanceQrRedemption?
+  verificationAttempts FaceVerificationAttempt[]
+
+  @@index([employeeId, status, createdAt])
+  @@index([kioskBindingHash, createdAt])
+  @@index([status, expiresAt])
+}
+
+model AttendanceQrRedemption {
+  tokenHash          String   @id
+  employeeId         String
+  challengeId        String?  @unique
+  punchId            String?  @unique
+  kioskBindingHash   String
+  expiresAt          DateTime
+  usedAt             DateTime?
+  createdAt          DateTime @default(now())
+
+  employee           Employee                 @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  challenge          AttendanceFaceChallenge? @relation(fields: [challengeId], references: [id], onDelete: SetNull)
+  punch              Punch?                   @relation(fields: [punchId], references: [id], onDelete: SetNull)
+
+  @@index([employeeId, createdAt])
+  @@index([kioskBindingHash, createdAt])
+  @@index([expiresAt])
 }
 
 model AttendanceContextLog {
@@ -1450,6 +1517,14 @@ enum PUNCH_TYPE {
   TIME_OUT
   BREAK_OUT
   BREAK_IN
+}
+
+enum AttendanceFaceChallengeStatus {
+  PENDING
+  PROCESSING
+  PASSED
+  FAILED
+  EXPIRED
 }
 
 enum GENDER {

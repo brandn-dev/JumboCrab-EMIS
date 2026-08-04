@@ -25,7 +25,7 @@ export type KioskPunchContext = {
   dayStart: Date;
 };
 
-const expectedNextPunch = (lastType?: PUNCH_TYPE | null) => {
+export const getExpectedNextPunch = (lastType?: PUNCH_TYPE | null) => {
   const allowedNext: Record<PUNCH_TYPE | "NONE", PUNCH_TYPE> = {
     NONE: PUNCH_TYPE.TIME_IN,
     TIME_OUT: PUNCH_TYPE.TIME_IN,
@@ -53,7 +53,7 @@ export const encodeEmployeeQrToken = (payload: object) => {
   return `${EMPLOYEE_QR_PREFIX}.${encodedPayload}.${signature}`;
 };
 
-const decodeEmployeeQrToken = (
+export const decodeEmployeeQrToken = (
   token: string,
 ): { userId: string; employeeId: string; exp: number } | null => {
   const trimmed = typeof token === "string" ? token.trim() : "";
@@ -198,7 +198,7 @@ export const ensureEmployeeQrIdentity = async (token: string) => {
     };
   }
 
-  return { success: true as const, data: identity };
+  return { success: true as const, data: identity, expiresAt: decoded.exp };
 };
 
 export const prepareKioskPunchContext = async (
@@ -245,7 +245,7 @@ export const prepareKioskPunchContext = async (
     };
   }
 
-  const nextPunch = expectedNextPunch(lastPunch?.punchType ?? null);
+  const nextPunch = getExpectedNextPunch(lastPunch?.punchType ?? null);
   if (nextPunch === PUNCH_TYPE.TIME_IN) {
     if (expected.scheduledStartMinutes == null) {
       return {

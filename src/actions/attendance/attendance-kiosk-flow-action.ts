@@ -3,11 +3,13 @@
 import { getSession } from "@/lib/auth";
 import {
   createPunchAndMaybeRecompute,
+  recomputeAttendanceForDay,
 } from "@/lib/attendance";
 import { publishAttendanceUpdate } from "@/lib/attendance-live/service";
 import {
   ATTENDANCE_PUNCH_MODES,
   ensureAttendanceSecuritySettings,
+  hasAttendanceFaceChallengeSchema,
   resolveAttendanceRequestMetadata,
   serializeAttendanceSecurityClientConfig,
 } from "./attendance-security-shared";
@@ -25,6 +27,11 @@ import {
   isKioskPunchIpAllowed,
   serializeKioskPunch,
 } from "./kiosk-attendance-shared";
+import {
+  AttendanceChallengeError,
+  issueAttendanceFaceChallenge,
+  recordAtomicQrOnlyPunch,
+} from "./attendance-face-challenge-service";
 
 const EMPLOYEE_QR_TTL_MS = 10_000;
 
@@ -87,7 +94,10 @@ export async function getEmployeeAttendanceQr() {
   }
 }
 
-export async function resolveEmployeeAttendanceQr(input: { token: string }) {
+export async function resolveEmployeeAttendanceQr(input: {
+  token: string;
+  kioskId?: string | null;
+}) {
   try {
     const requestMetadata = await resolveAttendanceRequestMetadata();
     if (!isKioskPunchIpAllowed(requestMetadata.ipAddress)) {
@@ -108,6 +118,40 @@ export async function resolveEmployeeAttendanceQr(input: { token: string }) {
       return context;
     }
 
+    const settings = await ensureAttendanceSecuritySettings();
+    if (
+      settings.attendancePunchMode ===
+      ATTENDANCE_PUNCH_MODES.SEARCH_EMPLOYEE_KIOSK_FACE
+    ) {
+      return {
+        success: false,
+        error: "Employee QR is disabled in search face mode.",
+        reason: "invalid_mode",
+      };
+    }
+    let challenge = null;
+    if (
+      settings.attendancePunchMode ===
+      ATTENDANCE_PUNCH_MODES.EMPLOYEE_QR_KIOSK_FACE
+    ) {
+      if (!(await hasAttendanceFaceChallengeSchema())) {
+        return {
+          success: false,
+          error: "Secure face challenge migration is not installed.",
+          reason: "security_migration_required",
+        };
+      }
+      challenge = await issueAttendanceFaceChallenge({
+        identity: context.data.employee,
+        expectedPunchType: context.data.nextPunch,
+        kioskId: input.kioskId,
+        requestMetadata,
+        settings,
+        qrToken: input.token,
+        qrExpiresAt: resolved.expiresAt,
+      });
+    }
+
     return {
       success: true,
       data: {
@@ -117,19 +161,26 @@ export async function resolveEmployeeAttendanceQr(input: { token: string }) {
         employeeName:
           `${context.data.employee.firstName} ${context.data.employee.lastName}`.trim(),
         nextPunch: context.data.nextPunch,
+        ...(challenge ?? {}),
       },
     };
   } catch (error) {
     console.error("Failed to resolve employee attendance QR", error);
     return {
       success: false,
-      error: "Failed to resolve employee attendance QR",
+      error:
+        error instanceof AttendanceChallengeError
+          ? error.message
+          : "Failed to resolve employee attendance QR",
+      reason:
+        error instanceof AttendanceChallengeError ? error.reason : undefined,
     };
   }
 }
 
 export async function recordKioskResolvedPunch(input: {
   token: string;
+  kioskId?: string | null;
   latitude?: number | null;
   longitude?: number | null;
 }) {
@@ -161,21 +212,51 @@ export async function recordKioskResolvedPunch(input: {
     if (!context.success) {
       return context;
     }
+    if (Date.now() >= resolved.expiresAt) {
+      return {
+        success: false,
+        error: "Employee QR expired. Scan a fresh QR.",
+        reason: "qr_expired",
+      };
+    }
 
-    const result = await createPunchAndMaybeRecompute({
-      employeeId: context.data.employee.employeeId,
-      punchType: context.data.nextPunch,
-      punchTime: context.data.now,
-      source: "KIOSK_QR",
-      recompute: true,
-    });
+    const challengeSchemaReady = await hasAttendanceFaceChallengeSchema();
+    const result = challengeSchemaReady
+      ? await recordAtomicQrOnlyPunch({
+          identity: context.data.employee,
+          expectedPunchType: context.data.nextPunch,
+          token: input.token,
+          tokenExpiresAt: resolved.expiresAt,
+          kioskId: input.kioskId,
+          requestMetadata,
+          payload: {
+            latitude: input.latitude,
+            longitude: input.longitude,
+          },
+        })
+      : await createPunchAndMaybeRecompute({
+          employeeId: context.data.employee.employeeId,
+          punchType: context.data.nextPunch,
+          punchTime: context.data.now,
+          source: "KIOSK_QR",
+          recompute: true,
+        });
+    const attendance =
+      "attendance" in result
+        ? result.attendance
+        : (
+            await recomputeAttendanceForDay(
+              context.data.employee.employeeId,
+              result.punch.punchTime,
+            )
+          ).attendance;
 
-    if (result.attendance?.id) {
+    if (attendance?.id) {
       await captureAttendanceSecurityEvent({
         punchId: result.punch.id,
-        attendanceId: result.attendance.id,
+        attendanceId: attendance.id,
         employeeId: context.data.employee.employeeId,
-        punchTime: context.data.now,
+        punchTime: result.punch.punchTime,
         payload: {
           ...requestMetadata,
           latitude: input.latitude ?? null,
@@ -186,7 +267,7 @@ export async function recordKioskResolvedPunch(input: {
 
     await publishAttendanceUpdate({
       employeeId: context.data.employee.employeeId,
-      workDate: context.data.dayStart,
+      workDate: "dayStart" in result ? result.dayStart : context.data.dayStart,
       punchId: result.punch.id,
     });
 
@@ -199,12 +280,21 @@ export async function recordKioskResolvedPunch(input: {
     };
   } catch (error) {
     console.error("Failed to record kiosk resolved punch", error);
-    return { success: false, error: "Failed to record punch" };
+    return {
+      success: false,
+      error:
+        error instanceof AttendanceChallengeError
+          ? error.message
+          : "Failed to record punch",
+      reason:
+        error instanceof AttendanceChallengeError ? error.reason : undefined,
+    };
   }
 }
 
 export async function getSearchEmployeeFacePreview(input: {
   employeeId: string;
+  kioskId?: string | null;
 }) {
   try {
     const requestMetadata = await resolveAttendanceRequestMetadata();
@@ -220,6 +310,24 @@ export async function getSearchEmployeeFacePreview(input: {
       typeof input.employeeId === "string" ? input.employeeId.trim() : "";
     if (!employeeId) {
       return { success: false, error: "Employee ID is required" };
+    }
+    const settings = await ensureAttendanceSecuritySettings();
+    if (
+      settings.attendancePunchMode !==
+      ATTENDANCE_PUNCH_MODES.SEARCH_EMPLOYEE_KIOSK_FACE
+    ) {
+      return {
+        success: false,
+        error: "Search face punch mode is not active.",
+        reason: "invalid_mode",
+      };
+    }
+    if (!(await hasAttendanceFaceChallengeSchema())) {
+      return {
+        success: false,
+        error: "Secure face challenge migration is not installed.",
+        reason: "security_migration_required",
+      };
     }
 
     const identity = toActiveEmployeeIdentity(
@@ -237,6 +345,13 @@ export async function getSearchEmployeeFacePreview(input: {
     if (!context.success) {
       return context;
     }
+    const challenge = await issueAttendanceFaceChallenge({
+      identity: context.data.employee,
+      expectedPunchType: context.data.nextPunch,
+      kioskId: input.kioskId,
+      requestMetadata,
+      settings,
+    });
 
     return {
       success: true,
@@ -246,13 +361,19 @@ export async function getSearchEmployeeFacePreview(input: {
         employeeCode: identity.employeeCode,
         employeeName: `${identity.firstName} ${identity.lastName}`.trim(),
         nextPunch: context.data.nextPunch,
+        ...challenge,
       },
     };
   } catch (error) {
     console.error("Failed to load search employee face preview", error);
     return {
       success: false,
-      error: "Failed to load employee face preview",
+      error:
+        error instanceof AttendanceChallengeError
+          ? error.message
+          : "Failed to load employee face preview",
+      reason:
+        error instanceof AttendanceChallengeError ? error.reason : undefined,
     };
   }
 }

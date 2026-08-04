@@ -26,6 +26,18 @@ export const DEFAULT_ATTENDANCE_SECURITY_SETTINGS = {
   faceLivenessRequired: true,
   faceMatchMaxDistance: FACE_MATCH_DEFAULT_DISTANCE,
   faceFailureMode: "BLOCK",
+  activeFaceChallengeRequired: true,
+  identityContinuityRequired: true,
+  passiveAntiSpoofRequired: false,
+  faceChallengeExpiresSeconds: 20,
+  faceChallengeActionCount: 2,
+  faceChallengeMaxFrames: 24,
+  faceChallengeMaxPayloadBytes: 1_250_000,
+  faceChallengeMaxAttemptsPerMinute: 5,
+  faceChallengeMaxFailures: 3,
+  faceChallengeCooldownSeconds: 60,
+  faceContinuityFrameCount: 5,
+  faceContinuityMaxDistance: 0.35,
 } as const;
 
 export type AttendanceSecurityClient = Prisma.TransactionClient | typeof db;
@@ -46,12 +58,25 @@ export type ResolvedAttendanceSecuritySettings = {
   faceLivenessRequired: boolean;
   faceMatchMaxDistance: number;
   faceFailureMode: string;
+  activeFaceChallengeRequired: boolean;
+  identityContinuityRequired: boolean;
+  passiveAntiSpoofRequired: boolean;
+  faceChallengeExpiresSeconds: number;
+  faceChallengeActionCount: number;
+  faceChallengeMaxFrames: number;
+  faceChallengeMaxPayloadBytes: number;
+  faceChallengeMaxAttemptsPerMinute: number;
+  faceChallengeMaxFailures: number;
+  faceChallengeCooldownSeconds: number;
+  faceContinuityFrameCount: number;
+  faceContinuityMaxDistance: number;
   updatedByUserId: string | null;
   createdAt: Date;
   updatedAt: Date;
 };
 
 let cachedHasAttendancePunchModeColumn: boolean | null = null;
+let cachedHasAttendanceFaceChallengeSchema: boolean | null = null;
 
 export const canManageAttendanceSecuritySettings = (role?: Roles) =>
   role === Roles.Admin;
@@ -126,7 +151,37 @@ export const hasAttendancePunchModeColumn = async () => {
   }
 };
 
-const buildAttendanceSecuritySelect = (hasModeColumn: boolean) =>
+export const hasAttendanceFaceChallengeSchema = async () => {
+  if (cachedHasAttendanceFaceChallengeSchema != null) {
+    return cachedHasAttendanceFaceChallengeSchema;
+  }
+  try {
+    const rows = await db.$queryRaw<Array<{ exists: boolean }>>`
+      SELECT (
+        to_regclass('public."AttendanceFaceChallenge"') IS NOT NULL
+        AND to_regclass('public."AttendanceQrRedemption"') IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'AttendanceSecuritySetting'
+            AND column_name = 'activeFaceChallengeRequired'
+        )
+      ) AS "exists"
+    `;
+    cachedHasAttendanceFaceChallengeSchema = Boolean(rows[0]?.exists);
+    return cachedHasAttendanceFaceChallengeSchema;
+  } catch (error) {
+    console.error("Could not check attendance face challenge schema:", error);
+    cachedHasAttendanceFaceChallengeSchema = false;
+    return false;
+  }
+};
+
+const buildAttendanceSecuritySelect = (
+  hasModeColumn: boolean,
+  hasChallengeSchema: boolean,
+) =>
   ({
     id: true,
     gpsValidationEnabled: true,
@@ -136,6 +191,22 @@ const buildAttendanceSecuritySelect = (hasModeColumn: boolean) =>
     faceLivenessRequired: true,
     faceMatchMaxDistance: true,
     faceFailureMode: true,
+    ...(hasChallengeSchema
+      ? {
+          activeFaceChallengeRequired: true,
+          identityContinuityRequired: true,
+          passiveAntiSpoofRequired: true,
+          faceChallengeExpiresSeconds: true,
+          faceChallengeActionCount: true,
+          faceChallengeMaxFrames: true,
+          faceChallengeMaxPayloadBytes: true,
+          faceChallengeMaxAttemptsPerMinute: true,
+          faceChallengeMaxFailures: true,
+          faceChallengeCooldownSeconds: true,
+          faceContinuityFrameCount: true,
+          faceContinuityMaxDistance: true,
+        }
+      : {}),
     updatedByUserId: true,
     createdAt: true,
     updatedAt: true,
@@ -150,6 +221,18 @@ const hydrateAttendanceSecuritySettings = (
     faceLivenessRequired: boolean;
     faceMatchMaxDistance: Prisma.Decimal | number;
     faceFailureMode: string;
+    activeFaceChallengeRequired?: boolean;
+    identityContinuityRequired?: boolean;
+    passiveAntiSpoofRequired?: boolean;
+    faceChallengeExpiresSeconds?: number;
+    faceChallengeActionCount?: number;
+    faceChallengeMaxFrames?: number;
+    faceChallengeMaxPayloadBytes?: number;
+    faceChallengeMaxAttemptsPerMinute?: number;
+    faceChallengeMaxFailures?: number;
+    faceChallengeCooldownSeconds?: number;
+    faceContinuityFrameCount?: number;
+    faceContinuityMaxDistance?: Prisma.Decimal | number;
     updatedByUserId: string | null;
     createdAt: Date;
     updatedAt: Date;
@@ -175,6 +258,43 @@ const hydrateAttendanceSecuritySettings = (
     faceLivenessRequired: Boolean(row.faceLivenessRequired),
     faceMatchMaxDistance: Number(row.faceMatchMaxDistance),
     faceFailureMode: row.faceFailureMode,
+    activeFaceChallengeRequired:
+      row.activeFaceChallengeRequired ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.activeFaceChallengeRequired,
+    identityContinuityRequired:
+      row.identityContinuityRequired ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.identityContinuityRequired,
+    passiveAntiSpoofRequired:
+      row.passiveAntiSpoofRequired ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.passiveAntiSpoofRequired,
+    faceChallengeExpiresSeconds:
+      row.faceChallengeExpiresSeconds ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeExpiresSeconds,
+    faceChallengeActionCount:
+      row.faceChallengeActionCount ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeActionCount,
+    faceChallengeMaxFrames:
+      row.faceChallengeMaxFrames ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxFrames,
+    faceChallengeMaxPayloadBytes:
+      row.faceChallengeMaxPayloadBytes ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxPayloadBytes,
+    faceChallengeMaxAttemptsPerMinute:
+      row.faceChallengeMaxAttemptsPerMinute ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxAttemptsPerMinute,
+    faceChallengeMaxFailures:
+      row.faceChallengeMaxFailures ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxFailures,
+    faceChallengeCooldownSeconds:
+      row.faceChallengeCooldownSeconds ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeCooldownSeconds,
+    faceContinuityFrameCount:
+      row.faceContinuityFrameCount ??
+      DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceContinuityFrameCount,
+    faceContinuityMaxDistance: Number(
+      row.faceContinuityMaxDistance ??
+        DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceContinuityMaxDistance,
+    ),
     updatedByUserId: row.updatedByUserId ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -184,8 +304,14 @@ const hydrateAttendanceSecuritySettings = (
 export const ensureAttendanceSecuritySettings = async (
   client: AttendanceSecurityClient = db,
 ) => {
-  const hasModeColumn = await hasAttendancePunchModeColumn();
-  const select = buildAttendanceSecuritySelect(hasModeColumn);
+  const [hasModeColumn, hasChallengeSchema] = await Promise.all([
+    hasAttendancePunchModeColumn(),
+    hasAttendanceFaceChallengeSchema(),
+  ]);
+  const select = buildAttendanceSecuritySelect(
+    hasModeColumn,
+    hasChallengeSchema,
+  );
   const row = await client.attendanceSecuritySetting.upsert({
     where: { id: ATTENDANCE_SECURITY_SETTINGS_ID },
     update: {},
@@ -207,6 +333,34 @@ export const ensureAttendanceSecuritySettings = async (
       faceMatchMaxDistance:
         DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceMatchMaxDistance,
       faceFailureMode: DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceFailureMode,
+      ...(hasChallengeSchema
+        ? {
+            activeFaceChallengeRequired:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.activeFaceChallengeRequired,
+            identityContinuityRequired:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.identityContinuityRequired,
+            passiveAntiSpoofRequired:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.passiveAntiSpoofRequired,
+            faceChallengeExpiresSeconds:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeExpiresSeconds,
+            faceChallengeActionCount:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeActionCount,
+            faceChallengeMaxFrames:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxFrames,
+            faceChallengeMaxPayloadBytes:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxPayloadBytes,
+            faceChallengeMaxAttemptsPerMinute:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxAttemptsPerMinute,
+            faceChallengeMaxFailures:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeMaxFailures,
+            faceChallengeCooldownSeconds:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceChallengeCooldownSeconds,
+            faceContinuityFrameCount:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceContinuityFrameCount,
+            faceContinuityMaxDistance:
+              DEFAULT_ATTENDANCE_SECURITY_SETTINGS.faceContinuityMaxDistance,
+          }
+        : {}),
     },
     select,
   });
@@ -225,6 +379,18 @@ export const serializeAttendanceSecuritySettings = (
   faceLivenessRequired: row.faceLivenessRequired,
   faceMatchMaxDistance: row.faceMatchMaxDistance,
   faceFailureMode: row.faceFailureMode,
+  activeFaceChallengeRequired: row.activeFaceChallengeRequired,
+  identityContinuityRequired: row.identityContinuityRequired,
+  passiveAntiSpoofRequired: row.passiveAntiSpoofRequired,
+  faceChallengeExpiresSeconds: row.faceChallengeExpiresSeconds,
+  faceChallengeActionCount: row.faceChallengeActionCount,
+  faceChallengeMaxFrames: row.faceChallengeMaxFrames,
+  faceChallengeMaxPayloadBytes: row.faceChallengeMaxPayloadBytes,
+  faceChallengeMaxAttemptsPerMinute: row.faceChallengeMaxAttemptsPerMinute,
+  faceChallengeMaxFailures: row.faceChallengeMaxFailures,
+  faceChallengeCooldownSeconds: row.faceChallengeCooldownSeconds,
+  faceContinuityFrameCount: row.faceContinuityFrameCount,
+  faceContinuityMaxDistance: row.faceContinuityMaxDistance,
   updatedByUserId: row.updatedByUserId ?? null,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
@@ -240,4 +406,16 @@ export const serializeAttendanceSecurityClientConfig = (
   faceLivenessRequired: row.faceLivenessRequired,
   faceMatchMaxDistance: row.faceMatchMaxDistance,
   faceFailureMode: row.faceFailureMode,
+  activeFaceChallengeRequired: row.activeFaceChallengeRequired,
+  identityContinuityRequired: row.identityContinuityRequired,
+  passiveAntiSpoofRequired: row.passiveAntiSpoofRequired,
+  faceChallengeExpiresSeconds: row.faceChallengeExpiresSeconds,
+  faceChallengeActionCount: row.faceChallengeActionCount,
+  faceChallengeMaxFrames: row.faceChallengeMaxFrames,
+  faceChallengeMaxPayloadBytes: row.faceChallengeMaxPayloadBytes,
+  faceChallengeMaxAttemptsPerMinute: row.faceChallengeMaxAttemptsPerMinute,
+  faceChallengeMaxFailures: row.faceChallengeMaxFailures,
+  faceChallengeCooldownSeconds: row.faceChallengeCooldownSeconds,
+  faceContinuityFrameCount: row.faceContinuityFrameCount,
+  faceContinuityMaxDistance: row.faceContinuityMaxDistance,
 });
