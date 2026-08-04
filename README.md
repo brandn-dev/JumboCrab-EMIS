@@ -29,9 +29,12 @@ FACE_SERVICE_URL=http://YOUR_PROXMOX_VM_IP:8001
 FACE_SERVICE_API_KEY=change-this-long-random-key
 FACE_MATCH_PROVIDER=insightface
 FACE_ENCRYPTION_KEY=change-this-long-random-secret
+KIOSK_CHALLENGE_SECRET=change-this-other-long-random-secret
 ```
 
 Employees must re-enroll face templates after switching to InsightFace.
+See [attendance face security](docs/ATTENDANCE_FACE_SECURITY.md) for threat model,
+challenge flow, migration, deployment, testing, and current passive-PAD limits.
 
 ## Learn More
 
