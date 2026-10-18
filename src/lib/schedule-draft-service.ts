@@ -381,6 +381,7 @@ export async function listScheduleDraftsForWeek(input: { weekStart: string; owne
   }
 
   return Array.from(byLineage.values())
+    .filter((versions) => versions[0]?.status !== AiScheduleDraftStatus.DISCARDED)
     .map((versions) => ({
       latest: serializeDraftSummary(versions[0]),
       versions: versions.map(serializeDraftSummary),
@@ -766,7 +767,9 @@ export async function discardScheduleDraft(input: { draftId: string; ownerUserId
   });
   if (!draft) throw new ScheduleDraftServiceError("Draft not found.");
   if (draft.status === AiScheduleDraftStatus.DISCARDED) return { success: true };
-  if (draft.status !== AiScheduleDraftStatus.DRAFT) throw new ScheduleDraftServiceError("Only an editable draft can be discarded.");
+  if (draft.status !== AiScheduleDraftStatus.DRAFT && draft.status !== AiScheduleDraftStatus.VALIDATED) {
+    throw new ScheduleDraftServiceError("Only an unapproved draft can be discarded. Approved and published schedules are protected.");
+  }
   const latest = await db.aiScheduleDraft.findFirst({
     where: { lineageId: draft.lineageId, createdByUserId: input.ownerUserId },
     orderBy: { version: "desc" },
@@ -775,17 +778,73 @@ export async function discardScheduleDraft(input: { draftId: string; ownerUserId
   if (latest?.id !== draft.id) throw new ScheduleDraftServiceError("Only the latest draft version can be discarded.");
 
   await db.$transaction(async (tx) => {
-    await tx.aiScheduleDraft.update({
-      where: { id: draft.id },
+    const updated = await tx.aiScheduleDraft.updateMany({
+      where: {
+        id: draft.id,
+        version: draft.version,
+        status: { in: [AiScheduleDraftStatus.DRAFT, AiScheduleDraftStatus.VALIDATED] },
+      },
       data: { status: AiScheduleDraftStatus.DISCARDED },
+    });
+    if (updated.count !== 1) throw new ScheduleDraftServiceError("Draft changed while discarding. Reload and try again.");
+    await tx.aiConversation.updateMany({
+      where: { activeDraftId: draft.id },
+      data: { activeDraftId: null, pendingInteraction: Prisma.DbNull },
     });
     await createDraftAudit(tx, {
       actorUserId: input.ownerUserId,
       action: "DRAFT_DISCARDED",
       draftId: draft.id,
       outcome: "SUCCEEDED",
-      metadata: { lineageId: draft.lineageId, version: draft.version },
+      metadata: { lineageId: draft.lineageId, version: draft.version, previousStatus: draft.status },
     });
-  });
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   return { success: true };
+}
+
+export async function discardScheduleDraftsForWeek(input: { weekStart: string; ownerUserId: string }) {
+  const weekStart = parseWeekStartInput(input.weekStart);
+  if (!weekStart) throw new ScheduleDraftServiceError("Invalid weekStart.");
+
+  return db.$transaction(async (tx) => {
+    const rows = await tx.aiScheduleDraft.findMany({
+      where: { weekStart, createdByUserId: input.ownerUserId },
+      orderBy: [{ lineageId: "asc" }, { version: "desc" }],
+      select: { id: true, lineageId: true, version: true, status: true },
+    });
+    const latestByLineage = new Map<string, typeof rows[number]>();
+    for (const row of rows) {
+      if (!latestByLineage.has(row.lineageId)) latestByLineage.set(row.lineageId, row);
+    }
+    const discardable = Array.from(latestByLineage.values()).filter((draft) =>
+      draft.status === AiScheduleDraftStatus.DRAFT || draft.status === AiScheduleDraftStatus.VALIDATED,
+    );
+    let discardedCount = 0;
+    for (const draft of discardable) {
+      const updated = await tx.aiScheduleDraft.updateMany({
+        where: {
+          id: draft.id,
+          version: draft.version,
+          status: { in: [AiScheduleDraftStatus.DRAFT, AiScheduleDraftStatus.VALIDATED] },
+        },
+        data: { status: AiScheduleDraftStatus.DISCARDED },
+      });
+      if (updated.count !== 1) {
+        throw new ScheduleDraftServiceError("A draft changed while discarding. Reload the week and try again.");
+      }
+      await tx.aiConversation.updateMany({
+        where: { activeDraftId: draft.id },
+        data: { activeDraftId: null, pendingInteraction: Prisma.DbNull },
+      });
+      await createDraftAudit(tx, {
+        actorUserId: input.ownerUserId,
+        action: "DRAFT_DISCARDED",
+        draftId: draft.id,
+        outcome: "SUCCEEDED",
+        metadata: { lineageId: draft.lineageId, version: draft.version, previousStatus: draft.status, bulkWeekDiscard: true },
+      });
+      discardedCount += 1;
+    }
+    return { discardedCount };
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 }

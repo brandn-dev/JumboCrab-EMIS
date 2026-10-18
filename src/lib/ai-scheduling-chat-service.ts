@@ -9,27 +9,30 @@ import { requireScheduleManager } from "@/lib/scheduling-auth";
 import {
   isAiSchedulingChatEnabled,
   extractShiftReferenceFromMessage,
-  inferExplicitGroupShiftAssignment,
-  inferSchedulingAssignmentTarget,
   isExplicitBulkScheduleRequest,
+  matchesScheduleEmployeeQuery,
   needsBulkScheduleDateClarification,
   resolveExplicitEmployeeSelection,
   resolveExplicitBulkScheduleDates,
-  shouldPreserveExistingDayOff,
-  shouldUsePlannerWeekForShiftAssignment,
   resolveShiftReference,
   requiresEmployeeSelectionConfirmation,
   type EmployeeSelectionCandidate,
 } from "@/lib/ai-scheduling-chat-policy";
 import {
   applyShiftAssignmentProposal,
+  applyScheduleAssignmentSequence,
+  containsNaturalGroupName,
   distributeDayOffAssignments,
   canApplyScheduleOperation,
   isScheduleOperationExpired,
   isValidScheduleOperationSelection,
+  inferScheduleActionScopesFromText,
   matchesScheduleOperationDraftVersion,
   matchesNaturalGroupName,
+  mergePendingScheduleIntent,
+  selectRepresentativeScheduleChanges,
   scheduleOperationIntentSchema,
+  splitEmployeesEvenly,
   type ScheduleOperationIntent,
 } from "@/lib/ai-scheduling-operation-policy";
 import {
@@ -54,6 +57,7 @@ import {
   MAX_CHAT_COMPLETION_TOKENS,
   MAX_CHAT_FINAL_RESPONSE_TOKENS,
   MAX_CHAT_HISTORY_MESSAGES,
+  MAX_CHAT_INITIAL_TOOL_TOKENS,
   MAX_CHAT_MESSAGES_PER_CONVERSATION,
   MAX_CHAT_MESSAGES_PER_DAY,
   MAX_CHAT_MESSAGES_PER_MINUTE,
@@ -61,9 +65,13 @@ import {
   MAX_CHAT_TOOL_RESULT_CHARS,
   MAX_CHAT_TOOL_ROUNDS,
   buildSchedulingChatSystemPrompt,
+  explicitlyRequestsUnassignedScheduleCells,
+  getCompletionBudget,
   parseTextualProviderToolCalls,
   redactSensitiveText,
   sanitizeSchedulingAssistantMessage,
+  shouldRetryIncompleteCompletion,
+  validateProviderToolCalls,
   type ChatRequest,
 } from "@/lib/ai-scheduling-chat-policy";
 
@@ -112,7 +120,7 @@ type ScheduleInteraction = {
   summary: string;
   selectionMode?: "single" | "multiple";
   options?: ScheduleInteractionChoice[];
-  changes?: Array<{ employeeCode: string; employeeName: string; workDate: string; before: string; after: string }>;
+  changes?: Array<{ employeeCode: string; employeeName: string; workDate: string; before: string; after: string; planLabel?: string }>;
   changeCount?: number;
   changesTruncated?: boolean;
   warnings?: string[];
@@ -186,7 +194,13 @@ const parseToolArgs = <T>(schema: z.ZodType<T>, value: string): T => {
     throw new ScheduleChatError("Tool arguments were invalid.");
   }
   const parsed = schema.safeParse(decoded);
-  if (!parsed.success) throw new ScheduleChatError("Tool arguments were incomplete or invalid.");
+  if (!parsed.success) {
+    const details = parsed.error.issues.slice(0, 5).map((issue) => {
+      const path = issue.path.map(String).join(".");
+      return `${path || "arguments"}: ${issue.message}`;
+    });
+    throw new ScheduleChatError(`Tool arguments were incomplete or invalid: ${details.join("; ")}`);
+  }
   return parsed.data;
 };
 
@@ -581,7 +595,7 @@ const providerTools = [
     type: "function",
     function: {
       name: "propose_schedule_operation",
-      description: "Combine one group/employee target, shift code or name, dates, and keep-existing-days-off instruction into one validated proposal. Server resolves employees, positions, departments, shift codes, and planner week. This tool only creates a preview or clarification; it never changes draft assignments or live schedules.",
+      description: "Create one validated proposal containing ordered actions, each with its own optional employee/position/department scope and exclusions. Use action-level scopes for requests assigning different groups to different shifts. For an even split of one group across shifts, set the same allocationGroup on each action; server creates stable, balanced employee partitions. Later actions override earlier assignments only for employees and dates they target. Server resolves entities and validates the complete proposal; this tool never writes draft or live assignments.",
       parameters: {
         type: "object",
         properties: {
@@ -602,8 +616,31 @@ const providerTools = [
           targetEmployeeQuery: { type: ["string", "null"] },
           sourceDate: { type: ["string", "null"] },
           targetDate: { type: ["string", "null"] },
+          actions: {
+            type: "array",
+            maxItems: 7,
+            description: "Ordered changes for one combined draft proposal. Use when the sentence includes multiple related assignments or exceptions.",
+            items: {
+              type: "object",
+              properties: {
+                targetType: { type: ["string", "null"], enum: ["ALL", "POSITION", "DEPARTMENT", "EMPLOYEE", null], description: "Optional scope for this action; if omitted, inherit the proposal target." },
+                targetQuery: { type: ["string", "null"], description: "Position, department, or employee name/code for this action." },
+                targetEmployeeQueries: { type: "array", maxItems: 25, items: { type: "string" } },
+                excludeTargetQueries: { type: "array", maxItems: 10, items: { type: "string" }, description: "Groups or employees to leave unchanged within this action." },
+                allocationGroup: { type: ["string", "null"], description: "Use the same non-empty group name on actions that split one target group evenly across different shifts; server assigns employees to balanced, stable partitions." },
+                assignmentKind: { type: "string", enum: ["WORK", "DAY_OFF", "UNASSIGNED"] },
+                shiftRef: { type: ["string", "null"], description: "Active shift name/code for WORK; null for DAY_OFF or UNASSIGNED." },
+                workDates: { type: "array", maxItems: 7, items: { type: "string", description: "Exact date in the selected planner week." } },
+                usePlannerWeek: { type: "boolean" },
+                preserveExistingDayOff: { type: "boolean" },
+                onlyUnassigned: { type: "boolean" },
+              },
+              required: ["assignmentKind"],
+              additionalProperties: false,
+            },
+          },
         },
-        required: ["operation", "targetType", "targetQuery", "targetEmployeeQueries", "excludeTargetQueries", "shiftRef", "workDates", "usePlannerWeek", "preserveExistingDayOff", "onlyUnassigned", "dayOffCount", "minimumOnly", "noDayOffWeekdays", "sourceEmployeeQuery", "targetEmployeeQuery", "sourceDate", "targetDate"],
+        required: ["operation"],
         additionalProperties: false,
       },
     },
@@ -767,12 +804,11 @@ const executeTool = async (input: {
           weekDates: getWeekDates(parseWeekStartInput(draft.weekStart) ?? new Date()).map(({ date }) => toPlannerDateKey(date)),
           sourceMode: draft.sourceMode,
           referenceWeekStart: draft.sourceWeekStart,
-          scope: { departmentId: draft.scope.departmentId, employeeCount: employeeIds.length },
+          scope: { employeeCount: employeeIds.length },
           staleSource: draft.isSourceStale,
           assignmentCount: draft.assignmentCount,
           changedCellCount: changed.length,
           changedCells: changed.slice(0, 30).map((assignment) => ({
-            employeeId: assignment.employeeId,
             employeeCode: employeeById.get(assignment.employeeId)?.employeeCode ?? null,
             employeeName: employeeById.get(assignment.employeeId)
               ? `${employeeById.get(assignment.employeeId)!.firstName} ${employeeById.get(assignment.employeeId)!.lastName}`
@@ -781,10 +817,8 @@ const executeTool = async (input: {
             assignmentKind: assignment.assignmentKind,
           })),
           employees: employees.map((employee) => ({
-            employeeId: employee.employeeId,
             employeeCode: employee.employeeCode,
             displayName: `${employee.firstName} ${employee.lastName}`,
-            departmentId: employee.departmentId,
             department: employee.department?.name ?? null,
           })),
           employeeListTruncated: employees.length < employeeIds.length,
@@ -850,10 +884,8 @@ const executeTool = async (input: {
             .filter((employee) => !explicitlySelectedId || employee.employeeId === explicitlySelectedId)
             .map((employee, index) => ({
             option: index + 1,
-            employeeId: employee.employeeId,
             employeeCode: employee.employeeCode,
             displayName: `${employee.firstName} ${employee.lastName}`,
-            departmentId: employee.departmentId,
             department: employee.department?.name ?? null,
           })),
           departmentMatches: departments,
@@ -1223,18 +1255,10 @@ const executeTool = async (input: {
           select: { activeDraftId: true, pendingInteraction: true },
         });
         if (!conversation) throw new ScheduleChatError("Conversation not found.", 404);
-        let intent = args;
-        if (args.operation === "ASSIGN_SHIFT") {
-          const inferredTarget = args.targetType === "ALL" ? inferSchedulingAssignmentTarget(input.userMessage) : null;
-          intent = {
-            ...args,
-            ...(inferredTarget ?? {}),
-            usePlannerWeek: args.usePlannerWeek || (!args.workDates.length && shouldUsePlannerWeekForShiftAssignment(input.userMessage)),
-            preserveExistingDayOff: args.preserveExistingDayOff || shouldPreserveExistingDayOff(input.userMessage),
-            onlyUnassigned: args.onlyUnassigned || /\bunassigned\b/i.test(input.userMessage),
-          };
-        }
         const priorOperation = readPendingScheduleOperation(conversation.pendingInteraction);
+        let intent = priorOperation && ["CLARIFICATION", "PROPOSAL"].includes(priorOperation.status)
+          ? mergePendingScheduleIntent(priorOperation.intent, args)
+          : args;
         if (
           args.operation === "DISTRIBUTE_DAY_OFF" && priorOperation?.status === "CLARIFICATION" &&
           priorOperation.intent.operation === "NO_DAY_OFF" &&
@@ -1244,7 +1268,7 @@ const executeTool = async (input: {
           const restrictedWeekdays = priorOperation.intent.noDayOffWeekdays.length
             ? priorOperation.intent.noDayOffWeekdays
             : priorOperation.intent.workDates.map((date) => new Date(`${date}T00:00:00.000Z`).getUTCDay() || 7);
-          intent = { ...args, noDayOffWeekdays: Array.from(new Set([...args.noDayOffWeekdays, ...restrictedWeekdays])) };
+          intent = { ...intent, noDayOffWeekdays: Array.from(new Set([...intent.noDayOffWeekdays, ...restrictedWeekdays])) };
         }
         return prepareScheduleOperation({
           conversationId: input.conversationId,
@@ -1339,24 +1363,6 @@ const providerHistory = (rows: Array<{
   return bounded;
 };
 
-const parseProviderToolCalls = (value: unknown): ProviderToolCall[] => {
-  if (!Array.isArray(value)) return [];
-  return value.slice(0, MAX_CHAT_TOOL_CALLS_PER_TURN).flatMap((entry): ProviderToolCall[] => {
-    if (!entry || typeof entry !== "object") return [];
-    const call = entry as Record<string, unknown>;
-    const fn = call.function && typeof call.function === "object" ? call.function as Record<string, unknown> : null;
-    const rawArguments = fn && (typeof fn.arguments === "string" || (fn.arguments && typeof fn.arguments === "object"))
-      ? typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments)
-      : null;
-    if (
-      typeof call.id !== "string" || call.id.length > 120 ||
-      !fn || typeof fn.name !== "string" || !PROVIDER_TOOL_NAMES.has(fn.name) ||
-      !rawArguments || rawArguments.length > 8_000
-    ) return [];
-    return [{ id: call.id, name: fn.name, arguments: rawArguments }];
-  });
-};
-
 const readUsage = (value: unknown) => {
   if (!value || typeof value !== "object") return { promptTokens: 0, completionTokens: 0 };
   const usage = value as Record<string, unknown>;
@@ -1374,6 +1380,7 @@ const callOpenRouter = async (input: {
   allowToolCalls?: boolean;
 }) => {
   const allowToolCalls = input.allowToolCalls !== false;
+  const providerRequestId = randomUUID();
   const response = await fetch(OPENROUTER_CHAT_URL, {
     method: "POST",
     headers: {
@@ -1395,38 +1402,106 @@ const callOpenRouter = async (input: {
     }),
     signal: AbortSignal.timeout(MAX_PROVIDER_TIMEOUT_MS),
   });
-  if (!response.ok) throw new Error(`OpenRouter returned ${response.status}.`);
+  if (!response.ok) {
+    console.warn("[AI scheduling provider] OpenRouter request failed", {
+      providerRequestId,
+      model: input.model,
+      httpStatus: response.status,
+      responseContentType: response.headers.get("content-type") ?? "unknown",
+    });
+    throw new Error(`OpenRouter request failed (${response.status}).`);
+  }
   const data: unknown = await response.json();
-  if (!data || typeof data !== "object") throw new Error("OpenRouter response was invalid.");
+  if (!data || typeof data !== "object") {
+    console.warn("[AI scheduling provider] Invalid JSON response", { providerRequestId, model: input.model });
+    return {
+      content: "",
+      calls: [] as ProviderToolCall[],
+      usage: { promptTokens: 0, completionTokens: 0 },
+      estimatedCompletionTokens: 0,
+      finishReason: null as string | null,
+      incomplete: true,
+      diagnostics: { providerRequestId, responseMode: "invalid_json", rawToolCallCount: 0, rejectedToolCallCount: 0 },
+    };
+  }
   const body = data as Record<string, unknown>;
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const first = choices[0] && typeof choices[0] === "object" ? choices[0] as Record<string, unknown> : null;
   const message = first?.message && typeof first.message === "object" ? first.message as Record<string, unknown> : null;
-  if (!message) throw new Error("OpenRouter response contained no message.");
-  let content = typeof message.content === "string" ? message.content.slice(0, MAX_CHAT_TOOL_RESULT_CHARS) : "";
-  let calls = parseProviderToolCalls(message.tool_calls);
-  if (allowToolCalls && calls.length === 0) {
+  const finishReason = typeof first?.finish_reason === "string" ? first.finish_reason : null;
+  let content = typeof message?.content === "string" ? message.content.slice(0, MAX_CHAT_TOOL_RESULT_CHARS) : "";
+  const nativeCalls = validateProviderToolCalls({
+    value: message?.tool_calls,
+    allowedToolNames: Array.from(PROVIDER_TOOL_NAMES),
+    maxCalls: MAX_CHAT_TOOL_CALLS_PER_TURN,
+  });
+  let calls = nativeCalls.calls;
+  let rejectedToolCallCount = nativeCalls.rejectedCount;
+  let responseMode = calls.length ? "native_tool_calls" : content.trim() ? "text" : "empty";
+  let textualToolCallDetected = false;
+  if (allowToolCalls && calls.length === 0 && content) {
     const textual = parseTextualProviderToolCalls({
       content,
       allowedToolNames: Array.from(PROVIDER_TOOL_NAMES),
       maxCalls: MAX_CHAT_TOOL_CALLS_PER_TURN,
     });
     if (textual.detected) {
-      calls = textual.calls.map((call) => ({ id: randomUUID(), ...call }));
-      content = calls.length
-        ? ""
-        : "The assistant returned an unsupported scheduling-action format. Rephrase the request or use the draft controls.";
+      textualToolCallDetected = true;
+      const textualCalls = validateProviderToolCalls({
+        value: textual.calls.map((call) => ({ id: randomUUID(), function: call })),
+        allowedToolNames: Array.from(PROVIDER_TOOL_NAMES),
+        maxCalls: MAX_CHAT_TOOL_CALLS_PER_TURN,
+      });
+      calls = textualCalls.calls;
+      rejectedToolCallCount += textualCalls.rejectedCount || (textual.detected && textual.calls.length === 0 ? 1 : 0);
+      responseMode = calls.length ? "textual_tool_calls" : "invalid_tool_call_format";
+      if (calls.length) content = "";
     }
   } else if (!allowToolCalls && parseTextualProviderToolCalls({
     content,
     allowedToolNames: Array.from(PROVIDER_TOOL_NAMES),
     maxCalls: MAX_CHAT_TOOL_CALLS_PER_TURN,
   }).detected) {
-    content = "The assistant could not summarize the scheduling result. Review the draft preview before continuing.";
+    content = "";
+    rejectedToolCallCount += 1;
+    responseMode = "unexpected_tool_call_in_final_response";
+  }
+  const proposalCalls = calls.filter((call) => call.name === "propose_schedule_operation").length;
+  const multipleProposals = proposalCalls > 1;
+  if (multipleProposals) {
+    rejectedToolCallCount += proposalCalls;
+    calls = [];
+    content = "";
+    responseMode = "multiple_proposal_calls_rejected";
   }
   const usage = readUsage(body.usage);
   const estimatedCompletionTokens = Math.ceil((content.length + calls.reduce((total, call) => total + call.arguments.length, 0)) / 4);
-  return { content, calls, usage, estimatedCompletionTokens };
+  const incomplete = !message || multipleProposals || shouldRetryIncompleteCompletion({
+    finishReason,
+    content,
+    validToolCallCount: calls.length,
+    rejectedToolCallCount,
+  });
+  const diagnostics = {
+    providerRequestId,
+    model: typeof body.model === "string" ? body.model : input.model,
+    provider: typeof body.provider === "string" ? body.provider : null,
+    finishReason,
+    choiceCount: choices.length,
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens || estimatedCompletionTokens,
+    requestedMaxTokens: input.maxTokens,
+    requestedResponseFormat: allowToolCalls ? "native_function_tools" : "text_only",
+    responseMode,
+    contentLength: content.length,
+    rawToolCallCount: nativeCalls.rawCallCount,
+    rejectedToolCallCount,
+    textualToolCallDetected,
+  };
+  if (incomplete || finishReason === "length" || rejectedToolCallCount > 0) {
+    console.warn("[AI scheduling provider] Empty, incomplete, or invalid completion", diagnostics);
+  }
+  return { content, calls, usage, estimatedCompletionTokens, finishReason, incomplete, diagnostics };
 };
 
 const writeChatAudit = async (input: {
@@ -1496,6 +1571,7 @@ const makePendingOperation = async (input: {
 }) => {
   const id = randomUUID();
   const createdAt = new Date();
+  const previewChanges = input.changes ? selectRepresentativeScheduleChanges(input.changes, 100) : undefined;
   const interaction: ScheduleInteraction = {
     id,
     kind: input.status,
@@ -1503,7 +1579,7 @@ const makePendingOperation = async (input: {
     summary: input.summary,
     ...(input.selectionMode ? { selectionMode: input.selectionMode } : {}),
     ...(input.choices ? { options: input.choices.map(({ id: optionId, label, description }) => ({ id: optionId, label, ...(description ? { description } : {}) })) } : {}),
-    ...(input.changes ? { changes: input.changes.slice(0, 100), changeCount: input.changeCount ?? input.changes.length, changesTruncated: (input.changeCount ?? input.changes.length) > 100 } : {}),
+    ...(input.changes ? { changes: previewChanges, changeCount: input.changeCount ?? input.changes.length, changesTruncated: (input.changeCount ?? input.changes.length) > 100 } : {}),
     ...(input.warnings?.length ? { warnings: input.warnings.slice(0, 20) } : {}),
     ...(input.blockers?.length ? { blockers: input.blockers.slice(0, 30) } : {}),
     ...(input.canApply != null ? { canApply: input.canApply } : {}),
@@ -1528,7 +1604,7 @@ const makePendingOperation = async (input: {
     ...(input.selectionMode ? { selectionMode: input.selectionMode } : {}),
     ...(input.assignments ? { assignments: input.assignments } : {}),
     ...(input.beforeAssignments ? { beforeAssignments: input.beforeAssignments } : {}),
-    ...(input.changes ? { changes: input.changes.slice(0, 100) } : {}),
+    ...(previewChanges ? { changes: previewChanges } : {}),
     ...(input.warnings ? { warnings: input.warnings } : {}),
     ...(input.blockers ? { blockers: input.blockers } : {}),
     ...(input.appliedDraftId ? { appliedDraftId: input.appliedDraftId } : {}),
@@ -1571,15 +1647,7 @@ const findEmployeeTargets = (query: string, employees: Array<{
   position: { positionId: string; name: string; isActive: boolean; departmentId: string } | null;
   department: { departmentId: string; name: string; isActive: boolean } | null;
 }>) => {
-  const normalized = query.toLocaleLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  return employees.filter((employee) => {
-    const fullName = `${employee.firstName} ${employee.lastName}`.toLocaleLowerCase();
-    const reverseName = `${employee.lastName} ${employee.firstName}`.toLocaleLowerCase();
-    return employee.employeeCode.toLocaleLowerCase() === query.toLocaleLowerCase().trim() ||
-      fullName === normalized || reverseName === normalized ||
-      fullName.includes(normalized) || reverseName.includes(normalized) ||
-      `${employee.firstName} ${employee.lastName}`.toLocaleLowerCase().split(/\s+/).some((part) => part === normalized);
-  });
+  return employees.filter((employee) => matchesScheduleEmployeeQuery(query, employee));
 };
 
 const prepareScheduleOperation = async (input: {
@@ -1600,6 +1668,8 @@ const prepareScheduleOperation = async (input: {
     return { message: "This draft is not the latest editable version. Reload the current draft, then retry.", interaction: null as ScheduleInteraction | null };
   }
   const intent = scheduleOperationIntentSchema.parse(input.intent);
+  const actionsHaveOwnScopes = intent.actions.some((action) => action.targetType !== null || action.targetQuery !== null ||
+    action.targetEmployeeQueries.length > 0 || action.excludeTargetQueries.length > 0);
   const datesInWeek = weekDatesFor(draft.weekStart);
   const assignmentInputs = draft.assignments.map((assignment) => ({
     employeeId: assignment.employeeId,
@@ -1643,7 +1713,7 @@ const prepareScheduleOperation = async (input: {
     const weekDayNames = weekdays.map((weekday) => ["", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][weekday]);
     return makeClarification({
       title: "Restriction understood",
-      summary: `I’ll treat “no ${intent.targetQuery ?? "target group"} day off” on ${weekDayNames.join(", ")} as a constraint for this planning conversation. Tell me who should receive a day off, and I’ll prepare a preview. No standing company policy or schedule was changed.`,
+      summary: `I’ll treat the requested no-day-off restriction on ${weekDayNames.join(", ")} as a constraint for this planning conversation. Tell me who should receive a day off, and I’ll prepare a preview. No standing company policy or schedule was changed.`,
     });
   }
 
@@ -1745,7 +1815,9 @@ const prepareScheduleOperation = async (input: {
   let targetEmployeeIds = input.fixedTargetEmployeeIds
     ? input.fixedTargetEmployeeIds.filter((employeeId) => activeEmployees.some((employee) => employee.employeeId === employeeId))
     : [];
-  if (!input.fixedTargetEmployeeIds) {
+  if (!input.fixedTargetEmployeeIds && actionsHaveOwnScopes) {
+    targetEmployeeIds = activeEmployees.map((employee) => employee.employeeId);
+  } else if (!input.fixedTargetEmployeeIds) {
     if (intent.targetType === "ALL") {
       targetEmployeeIds = activeEmployees.map((employee) => employee.employeeId);
     } else if (intent.targetType === "EMPLOYEE") {
@@ -1759,14 +1831,14 @@ const prepareScheduleOperation = async (input: {
         if (matches.length === 0) {
           return makeClarification({
             title: "Employee not found",
-            summary: `I couldn't find “${query}” among active employees in this draft. Try full name or employee code. No changes made.`,
+            summary: "I couldn't match that person to an active employee in the selected draft. Try the employee's full name or employee code, or select a draft that includes them. No changes made.",
             targetEmployeeIds: resolvedEmployeeIds,
           });
         }
         if (matches.length > 1) {
           return makeClarification({
             title: "Which employee?",
-            summary: `More than one active employee matches “${query}”. Choose correct person.`,
+            summary: "More than one active employee matches this request. Choose the correct person.",
             choices: matches.map((employee) => newOperationChoice(
               `${employee.firstName} ${employee.lastName}`.trim(),
               [employee.position?.name, employee.department?.name, `Code ${employee.employeeCode}`].filter(Boolean).join(" · "),
@@ -1791,7 +1863,7 @@ const prepareScheduleOperation = async (input: {
         ));
         return makeClarification({
           title: `Choose ${intent.targetType === "POSITION" ? "position" : "department"}`,
-          summary: `I couldn't match “${intent.targetQuery}” to an active ${intent.targetType.toLocaleLowerCase()} in this draft. Choose an available group or edit request.`,
+          summary: `I couldn't match the requested group to an active ${intent.targetType.toLocaleLowerCase()} in this draft. Choose an available group or edit request.`,
           choices: options,
           selectionMode: "single",
         });
@@ -1806,7 +1878,7 @@ const prepareScheduleOperation = async (input: {
         ));
         return makeClarification({
           title: "Choose target group",
-          summary: `“${intent.targetQuery}” matches more than one active group. Choose the intended group.`,
+          summary: "The requested name matches more than one active group. Choose the intended group.",
           choices: options,
           selectionMode: "single",
         });
@@ -1821,14 +1893,14 @@ const prepareScheduleOperation = async (input: {
     return { message: "One or more selected employees are no longer active or inside this draft. Review target scope and try again.", interaction: null as ScheduleInteraction | null };
   }
 
-  for (const exclusion of intent.excludeTargetQueries) {
+  for (const exclusion of actionsHaveOwnScopes ? [] : intent.excludeTargetQueries) {
     const positionMatches = roleChoices(exclusion, "POSITION").matches;
     const departmentMatches = roleChoices(exclusion, "DEPARTMENT").matches;
     const employeeMatches = findEmployeeTargets(exclusion, activeEmployees);
     if (employeeMatches.length > 1) {
       return makeClarification({
         title: "Choose employee to exclude",
-        summary: `More than one active employee matches “${exclusion}”. Choose who to leave unchanged.`,
+        summary: "More than one active employee matches the exclusion. Choose who to leave unchanged.",
         choices: employeeMatches.map((employee) => newOperationChoice(
           `${employee.firstName} ${employee.lastName}`.trim(),
           [employee.position?.name, employee.department?.name, `Code ${employee.employeeCode}`].filter(Boolean).join(" · "),
@@ -1846,7 +1918,7 @@ const prepareScheduleOperation = async (input: {
       ...employeeMatches.map((employee) => employee.employeeId),
     ]);
     if (excludedIds.size === 0) {
-      return makeClarification({ title: "Check exclusion", summary: `I couldn't resolve excluded group “${exclusion}” in this draft. Confirm its position or department name; no changes made.` });
+      return makeClarification({ title: "Check exclusion", summary: "I couldn't resolve the excluded employee, position, or department in this draft. Confirm its name; no changes made." });
     }
     targetEmployeeIds = targetEmployeeIds.filter((employeeId) => !excludedIds.has(employeeId));
   }
@@ -1855,12 +1927,501 @@ const prepareScheduleOperation = async (input: {
     return makeClarification({ title: "No eligible employees", summary: "No active eligible employees match this request inside the selected draft. No changes made." });
   }
 
+  if (intent.actions.length > 0) {
+    const actions = intent.actions;
+    const shiftRows = await db.shift.findMany({
+      where: { isActive: true },
+      orderBy: [{ startMinutes: "asc" }, { code: "asc" }],
+      select: { id: true, code: true, name: true, isDayOff: true },
+    });
+    const resolvedActions: Array<{
+      dates: string[];
+      shiftId: number | null;
+      assignmentKind: "WORK" | "DAY_OFF" | "UNASSIGNED";
+      preserveExistingDayOff: boolean;
+      onlyUnassigned: boolean;
+      employeeIds: string[];
+      targetType: "ALL" | "POSITION" | "DEPARTMENT" | "EMPLOYEE";
+      targetLabel: string;
+      allocationGroup: string | null;
+      allocationIndex: number | null;
+      allocationSize: number | null;
+      inferredGroupKey: string | null;
+      inferredSplitRequested: boolean;
+    }> = [];
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      const action = actions[actionIndex];
+      const hasActionScope = action.targetType !== null || action.targetQuery !== null ||
+        action.targetEmployeeQueries.length > 0 || action.excludeTargetQueries.length > 0;
+      const targetType = action.targetType ?? intent.targetType;
+      const targetQuery = action.targetQuery ?? intent.targetQuery;
+      const employeeQueries = action.targetEmployeeQueries.length
+        ? action.targetEmployeeQueries
+        : targetType === "EMPLOYEE"
+          ? intent.targetEmployeeQueries.length ? intent.targetEmployeeQueries : targetQuery ? [targetQuery] : []
+          : [];
+      const exclusionQueries = action.excludeTargetQueries.length
+        ? action.excludeTargetQueries
+        : action.targetType === null ? intent.excludeTargetQueries : [];
+      const resolvesActionTarget = hasActionScope || actionsHaveOwnScopes;
+      let actionEmployeeIds = resolvesActionTarget ? [] : [...targetEmployeeIds];
+      let targetLabel = targetType === "ALL" ? "All employees" : targetQuery ?? "Selected employees";
+
+      if (resolvesActionTarget) {
+        if (targetType === "ALL") {
+          actionEmployeeIds = activeEmployees.map((employee) => employee.employeeId);
+        } else if (targetType === "EMPLOYEE") {
+          const resolvedIds: string[] = [];
+          for (let queryIndex = 0; queryIndex < employeeQueries.length; queryIndex += 1) {
+            const query = employeeQueries[queryIndex];
+            const matches = findEmployeeTargets(query, activeEmployees);
+            if (matches.length === 0) {
+              return makeClarification({
+                title: "Employee not found",
+                summary: `I couldn't match an employee for action ${actionIndex + 1}. Try the employee's full name or code. No changes made.`,
+                targetEmployeeIds: resolvedIds,
+              });
+            }
+            if (matches.length > 1) {
+              return makeClarification({
+                title: "Choose employee for action",
+                summary: `Choose the employee for action ${actionIndex + 1}.`,
+                choices: matches.map((employee) => newOperationChoice(
+                  `${employee.firstName} ${employee.lastName}`.trim(),
+                  [employee.position?.name, employee.department?.name, `Code ${employee.employeeCode}`].filter(Boolean).join(" · "),
+                  { kind: "ACTION_EMPLOYEE", actionIndex, queryIndex, employeeId: employee.employeeId, employeeCode: employee.employeeCode },
+                )),
+                selectionMode: "single",
+                targetEmployeeIds: resolvedIds,
+              });
+            }
+            resolvedIds.push(matches[0].employeeId);
+          }
+          actionEmployeeIds = Array.from(new Set(resolvedIds));
+          targetLabel = actionEmployeeIds.map((employeeId) => {
+            const employee = activeEmployees.find((candidate) => candidate.employeeId === employeeId)!;
+            return `${employee.firstName} ${employee.lastName} (${employee.employeeCode})`;
+          }).join(", ") || "Selected employees";
+        } else if ((targetType === "POSITION" || targetType === "DEPARTMENT") && targetQuery) {
+          const { rows, matches } = roleChoices(targetQuery, targetType);
+          if (matches.length !== 1) {
+            const options = (matches.length ? matches : rows).slice(0, 50).map((row) => newOperationChoice(
+              row.name,
+              "departmentName" in row ? row.departmentName : "Active department",
+              {
+                kind: "ACTION_GROUP",
+                actionIndex,
+                targetType,
+                groupName: row.name,
+              },
+            ));
+            return makeClarification({
+              title: matches.length ? "Choose action group" : "Group not found",
+              summary: matches.length
+                ? `Choose the position or department for action ${actionIndex + 1}.`
+                : `I couldn't match an active ${targetType.toLocaleLowerCase()} for action ${actionIndex + 1}. Choose an available group or edit the request.`,
+              choices: options,
+              selectionMode: "single",
+            });
+          }
+          const group = matches[0];
+          targetLabel = group.name;
+          actionEmployeeIds = activeEmployees.filter((employee) => targetType === "POSITION"
+            ? employee.position?.positionId === ("positionId" in group ? group.positionId : null)
+            : employee.department?.departmentId === ("departmentId" in group ? group.departmentId : null)).map((employee) => employee.employeeId);
+        }
+      }
+
+      const appliedExclusions: string[] = [];
+      for (const exclusion of exclusionQueries) {
+        const positionMatches = roleChoices(exclusion, "POSITION").matches;
+        const departmentMatches = roleChoices(exclusion, "DEPARTMENT").matches;
+        const employeeMatches = findEmployeeTargets(exclusion, activeEmployees);
+        if (employeeMatches.length > 1) {
+          return makeClarification({
+            title: "Choose employee to exclude",
+            summary: `Choose who to exclude from action ${actionIndex + 1}.`,
+            choices: employeeMatches.map((employee) => newOperationChoice(
+              `${employee.firstName} ${employee.lastName}`.trim(),
+              [employee.position?.name, employee.department?.name, `Code ${employee.employeeCode}`].filter(Boolean).join(" · "),
+              { kind: "ACTION_EXCLUDED_EMPLOYEE", actionIndex, employeeId: employee.employeeId, employeeCode: employee.employeeCode, exclusionQuery: exclusion },
+            )),
+            selectionMode: "single",
+            targetEmployeeIds: actionEmployeeIds,
+          });
+        }
+        const excludedGroups = activeEmployees.filter((employee) =>
+          (employee.position && positionMatches.some((position) => "positionId" in position && position.positionId === employee.position?.positionId)) ||
+          (employee.department && departmentMatches.some((department) => "departmentId" in department && department.departmentId === employee.department?.departmentId)),
+        );
+        const excludedIds = new Set([...excludedGroups.map((employee) => employee.employeeId), ...employeeMatches.map((employee) => employee.employeeId)]);
+        if (excludedIds.size === 0) {
+          return makeClarification({
+            title: "Check action exclusion",
+            summary: `I couldn't resolve an exclusion for action ${actionIndex + 1}. Confirm the employee, position, or department name. No changes made.`,
+            targetEmployeeIds: actionEmployeeIds,
+          });
+        }
+        actionEmployeeIds = actionEmployeeIds.filter((employeeId) => !excludedIds.has(employeeId));
+        appliedExclusions.push(...excludedGroups.map((employee) => employee.position?.name ?? employee.department?.name ?? "group"));
+        appliedExclusions.push(...employeeMatches.map((employee) => `${employee.firstName} ${employee.lastName}`));
+      }
+      if (appliedExclusions.length) targetLabel += ` except ${Array.from(new Set(appliedExclusions)).join(", ")}`;
+      if (actionEmployeeIds.length === 0) {
+        return makeClarification({
+          title: "No eligible employees",
+          summary: `No active employees match action ${actionIndex + 1} after its exclusions. No changes made.`,
+        });
+      }
+
+      const requestedDates = action.workDates.length
+        ? action.workDates
+        : action.usePlannerWeek
+          ? datesInWeek
+          : actions.length === 1
+            ? resolveExplicitBulkScheduleDates(input.sourceMessage, draft.weekStart, toPlannerDateKey(new Date())) ?? []
+            : [];
+      const uniqueDates = Array.from(new Set(requestedDates)).sort();
+      const outsideDates = uniqueDates.filter((date) => !datesInWeek.includes(date));
+      if (outsideDates.length) {
+        return makeClarification({
+          title: "Choose dates in this week",
+          summary: `${outsideDates.join(", ")} is outside displayed draft week ${draft.weekStart}. Choose valid dates for action ${actionIndex + 1}.`,
+          choices: datesInWeek.map((date) => newOperationChoice(
+            `${new Intl.DateTimeFormat("en", { weekday: "long", timeZone: "Asia/Manila" }).format(new Date(`${date}T12:00:00.000Z`))} · ${date}`,
+            undefined,
+            { kind: "ACTION_DATE", actionIndex, date },
+          )),
+          selectionMode: "multiple",
+          targetEmployeeIds: actionEmployeeIds,
+        });
+      }
+      if (uniqueDates.length === 0) {
+        if (action.dateSelectionMode === "PICK_DAYS") {
+          return makeClarification({
+            title: "Choose dates",
+            summary: `Select date(s) for action ${actionIndex + 1} in planner week ${draft.weekStart}.`,
+            choices: datesInWeek.map((date) => newOperationChoice(
+              `${new Intl.DateTimeFormat("en", { weekday: "long", timeZone: "Asia/Manila" }).format(new Date(`${date}T12:00:00.000Z`))} · ${date}`,
+              undefined,
+              { kind: "ACTION_DATE", actionIndex, date },
+            )),
+            selectionMode: "multiple",
+            targetEmployeeIds: actionEmployeeIds,
+          });
+        }
+        return makeClarification({
+          title: "Choose schedule range",
+          summary: `Choose the date range for action ${actionIndex + 1}.`,
+          choices: [
+            newOperationChoice("Whole week", `All seven days · ${draft.weekStart}`, { kind: "ACTION_DATE_SCOPE", actionIndex, scope: "WEEK" }),
+            newOperationChoice("Weekdays only", "Monday through Friday", { kind: "ACTION_DATE_SCOPE", actionIndex, scope: "WEEKDAYS" }),
+            newOperationChoice("Choose dates", "Pick one or more days", { kind: "ACTION_DATE_SCOPE", actionIndex, scope: "PICK_DAYS" }),
+          ],
+          selectionMode: "single",
+          targetEmployeeIds: actionEmployeeIds,
+        });
+      }
+
+      let shiftId: number | null = null;
+      if (action.assignmentKind === "WORK") {
+        const workingShifts = shiftRows.filter((shift) => !shift.isDayOff);
+        const shiftResult = action.shiftRef
+          ? resolveShiftReference(action.shiftRef, workingShifts)
+          : extractShiftReferenceFromMessage(input.sourceMessage, workingShifts);
+        if (shiftResult.status !== "resolved") {
+          const choices = workingShifts.map((shift) => newOperationChoice(
+            `${shift.code} · ${shift.name}`,
+            undefined,
+            { kind: "ACTION_SHIFT", actionIndex, shiftCode: shift.code },
+          ));
+          return makeClarification({
+            title: "Choose working shift",
+            summary: shiftResult.status === "ambiguous"
+              ? `Action ${actionIndex + 1} matches multiple active shifts. Choose one.`
+              : `I couldn't identify a working shift for action ${actionIndex + 1}. Choose an active shift.`,
+            choices,
+            selectionMode: "single",
+            targetEmployeeIds: actionEmployeeIds,
+          });
+        }
+        shiftId = shiftResult.shift.id;
+      } else if (action.assignmentKind === "DAY_OFF") {
+        const offShifts = shiftRows.filter((shift) => shift.isDayOff);
+        if (offShifts.length === 0) {
+          return makeClarification({
+            title: "Day-off shift not configured",
+            summary: "No active shift is marked as a day off. Configure a day-off shift, then retry. No draft changes were proposed.",
+            targetEmployeeIds: actionEmployeeIds,
+          });
+        }
+        const offMatch = action.shiftRef ? resolveShiftReference(action.shiftRef, offShifts) : null;
+        if (offMatch?.status === "resolved") shiftId = offMatch.shift.id;
+        else if (offShifts.length === 1 && !action.shiftRef) shiftId = offShifts[0].id;
+        else {
+          return makeClarification({
+            title: "Choose day-off shift",
+            summary: `Choose the active day-off shift for action ${actionIndex + 1}.`,
+            choices: offShifts.map((shift) => newOperationChoice(
+              `${shift.code} · ${shift.name}`,
+              undefined,
+              { kind: "ACTION_SHIFT", actionIndex, shiftCode: shift.code },
+            )),
+            selectionMode: "single",
+            targetEmployeeIds: actionEmployeeIds,
+          });
+        }
+      }
+      resolvedActions.push({
+        dates: uniqueDates,
+        shiftId,
+        assignmentKind: action.assignmentKind,
+        preserveExistingDayOff: action.preserveExistingDayOff,
+        onlyUnassigned: action.onlyUnassigned && explicitlyRequestsUnassignedScheduleCells(input.sourceMessage),
+        employeeIds: actionEmployeeIds,
+        targetType,
+        targetLabel,
+        allocationGroup: action.allocationGroup,
+        allocationIndex: null,
+        allocationSize: null,
+        inferredGroupKey: null,
+        inferredSplitRequested: false,
+      });
+    }
+
+    // Reconcile model scopes against the entities and shift mentions the user
+    // actually wrote. This prevents a repeated model target (e.g. Cashier for
+    // every action) from silently dropping a later group such as Cook.
+    const scopeCandidates = [
+      ...Array.from(positionRows.values()).map((position) => ({
+        id: position.positionId,
+        type: "POSITION" as const,
+        name: position.name,
+        employeeIds: activeEmployees
+          .filter((employee) => employee.position?.positionId === position.positionId)
+          .map((employee) => employee.employeeId),
+      })),
+      ...Array.from(departmentRows.values()).map((department) => ({
+        id: department.departmentId,
+        type: "DEPARTMENT" as const,
+        name: department.name,
+        employeeIds: activeEmployees
+          .filter((employee) => employee.department?.departmentId === department.departmentId)
+          .map((employee) => employee.employeeId),
+      })),
+    ];
+    const inferredScopes = inferScheduleActionScopesFromText({
+      message: input.sourceMessage,
+      groups: scopeCandidates,
+      shifts: shiftRows,
+      actionShiftIds: resolvedActions.map((action) => action.shiftId),
+      allEmployeeIds: activeEmployees.map((employee) => employee.employeeId),
+    });
+    inferredScopes.forEach((scope, index) => {
+      if (!scope || scope.employeeIds.length === 0) return;
+      resolvedActions[index].employeeIds = scope.employeeIds;
+      resolvedActions[index].targetType = scope.targetType;
+      resolvedActions[index].targetLabel = scope.targetLabel;
+      resolvedActions[index].inferredGroupKey = scope.groupKey;
+      resolvedActions[index].inferredSplitRequested = scope.splitRequested;
+    });
+
+    // When the user says a group should be split between named shifts, make
+    // those action scopes disjoint and deterministic before validating them.
+    const inferredSplitGroups = new Map<string, number[]>();
+    resolvedActions.forEach((action, index) => {
+      if (!action.inferredSplitRequested || !action.inferredGroupKey) return;
+      inferredSplitGroups.set(action.inferredGroupKey, [
+        ...(inferredSplitGroups.get(action.inferredGroupKey) ?? []),
+        index,
+      ]);
+    });
+    for (const [groupKey, indexes] of inferredSplitGroups) {
+      const distinctShifts = new Set(indexes.map((index) => resolvedActions[index].shiftId));
+      if (indexes.length > 1 && distinctShifts.size > 1) {
+        indexes.forEach((index) => {
+          if (!resolvedActions[index].allocationGroup) {
+            resolvedActions[index].allocationGroup = `inferred:${groupKey}`;
+          }
+        });
+      }
+    }
+
+    const allocationGroups = new Map<string, number[]>();
+    resolvedActions.forEach((action, index) => {
+      if (!action.allocationGroup) return;
+      allocationGroups.set(action.allocationGroup, [...(allocationGroups.get(action.allocationGroup) ?? []), index]);
+    });
+    for (const [groupName, indexes] of allocationGroups) {
+      if (indexes.length < 2) {
+        return makeClarification({ title: "Incomplete employee split", summary: "An even split needs at least two shift actions. No changes made." });
+      }
+      const firstAction = resolvedActions[indexes[0]];
+      const sameTarget = indexes.every((index) => {
+        const employeeIds = resolvedActions[index].employeeIds;
+        return employeeIds.length === firstAction.employeeIds.length && firstAction.employeeIds.every((employeeId) => employeeIds.includes(employeeId));
+      });
+      const sameDates = indexes.every((index) => {
+        const dates = resolvedActions[index].dates;
+        return dates.length === firstAction.dates.length && firstAction.dates.every((date) => dates.includes(date));
+      });
+      if (!sameTarget || !sameDates) {
+        return makeClarification({
+          title: "Review employee split",
+          summary: "Actions in an even split must use the same employee group and dates. No changes made; edit the request and preview again.",
+          targetEmployeeIds: firstAction.employeeIds,
+        });
+      }
+      const partitions = splitEmployeesEvenly(firstAction.employeeIds, indexes.length, `${draft.weekStart}:${groupName}`);
+      indexes.forEach((index, partitionIndex) => {
+        resolvedActions[index].employeeIds = partitions[partitionIndex];
+        resolvedActions[index].allocationIndex = partitionIndex + 1;
+        resolvedActions[index].allocationSize = partitions[partitionIndex].length;
+      });
+    }
+
+    const mentionedGroupNames = Array.from(new Set([
+      ...positionRows.values(),
+      ...departmentRows.values(),
+    ].map((group) => group.name).filter((name) => containsNaturalGroupName(input.sourceMessage, name))));
+    const incompleteGroups = mentionedGroupNames.filter((name) => {
+      const hasTargetAction = resolvedActions.some((action) =>
+        (action.targetType === "POSITION" || action.targetType === "DEPARTMENT") &&
+        matchesNaturalGroupName(action.targetLabel, name),
+      );
+      if (hasTargetAction) return false;
+      const isExplicitlyExcluded = /\b(?:except|excluding|without|but\s+not)\b/i.test(input.sourceMessage) &&
+        resolvedActions.some((action) => action.targetType === "ALL" && action.targetLabel.includes(" except ") && matchesNaturalGroupName(action.targetLabel, name));
+      return !isExplicitlyExcluded;
+    });
+    if (incompleteGroups.length) {
+      return makeClarification({
+        title: "Incomplete group plan",
+        summary: `The proposal doesn't assign every group named in your request: ${incompleteGroups.join(", ")}. No changes were proposed; edit the request or use the planner controls.`,
+      });
+    }
+
+    const sourceTokens = new Set(input.sourceMessage.toLocaleLowerCase().replace(/[^a-z0-9]+/g, " ").split(/\s+/).filter(Boolean));
+    const genericShiftWords = new Set(["shift", "day", "off", "work", "the", "and", "set", "to", "on", "rest", "half"]);
+    const mentionedWorkShifts = shiftRows.filter((shift) => !shift.isDayOff && [shift.code, shift.name].some((label) =>
+      label.toLocaleLowerCase().replace(/[^a-z0-9]+/g, " ").split(/\s+/).some((token) =>
+        token.length > 1 && !genericShiftWords.has(token) && sourceTokens.has(token),
+      ),
+    ));
+    const missingWorkShifts = mentionedWorkShifts.filter((shift) => !resolvedActions.some((action) => action.shiftId === shift.id));
+    if (missingWorkShifts.length) {
+      return makeClarification({
+        title: "Incomplete shift plan",
+        summary: `The proposal left out shift(s) named in your request: ${missingWorkShifts.map((shift) => `${shift.code} · ${shift.name}`).join(", ")}. No changes were proposed; edit the request and try again.`,
+      });
+    }
+
+    targetEmployeeIds = Array.from(new Set(resolvedActions.flatMap((action) => action.employeeIds)));
+    const actionDescriptions = resolvedActions.map((action) => {
+      const shift = shiftRows.find((candidate) => candidate.id === action.shiftId);
+      const assignmentLabel = action.assignmentKind === "DAY_OFF"
+        ? `OFF${shift ? ` · ${shift.code}` : ""}`
+        : action.assignmentKind === "UNASSIGNED"
+          ? "Unassigned"
+          : shift ? `${shift.code} · ${shift.name}` : "Working shift";
+      const datesLabel = action.dates.length === datesInWeek.length && datesInWeek.every((date) => action.dates.includes(date))
+        ? "whole week"
+        : action.dates.join(", ");
+      const targetCount = action.allocationIndex !== null
+        ? `${action.allocationSize} of ${resolvedActions.filter((candidate) => candidate.allocationGroup === action.allocationGroup).reduce((count, candidate) => count + candidate.allocationSize!, 0)} evenly split employees`
+        : `${action.employeeIds.length} employees`;
+      const allocationLabel = action.allocationIndex !== null
+        ? ` · split ${action.allocationIndex}/${allocationGroups.get(action.allocationGroup!)!.length}`
+        : "";
+      return `${action.targetLabel} (${targetCount}${allocationLabel}) → ${assignmentLabel} · ${datesLabel}`;
+    });
+
+    const sequence = applyScheduleAssignmentSequence({
+      assignments: assignmentInputs,
+      employeeIds: targetEmployeeIds,
+      actions: resolvedActions,
+    });
+    const nextAssignments = sequence.assignments;
+    const findChangedAssignments = nextAssignments.filter((assignment) => {
+      const before = assignmentInputs.find((candidate) => candidate.employeeId === assignment.employeeId && candidate.workDate === assignment.workDate);
+      return before && (before.shiftId !== assignment.shiftId || before.assignmentKind !== assignment.assignmentKind);
+    });
+    const employeeById = new Map(draft.assignments.map((assignment) => [assignment.employeeId, assignment]));
+    const changes = findChangedAssignments.map((assignment) => {
+      const before = assignmentInputs.find((candidate) => candidate.employeeId === assignment.employeeId && candidate.workDate === assignment.workDate)!;
+      const employee = employeeById.get(assignment.employeeId);
+      const finalAction = [...resolvedActions].reverse().find((action) =>
+        action.employeeIds.includes(assignment.employeeId) &&
+        action.dates.includes(assignment.workDate) &&
+        action.shiftId === assignment.shiftId &&
+        action.assignmentKind === assignment.assignmentKind,
+      );
+      const after = formatShiftAssignment(assignment, shiftRows);
+      return {
+        employeeCode: employee?.employeeCode ?? "",
+        employeeName: employee?.employeeName ?? "Employee",
+        workDate: assignment.workDate,
+        before: formatShiftAssignment(before, shiftRows),
+        after,
+        ...(finalAction ? { planLabel: `${finalAction.targetLabel} → ${after}` } : {}),
+      };
+    });
+    const candidateAssignments = nextAssignments.map((assignment) => ({
+      employeeId: assignment.employeeId,
+      workDate: assignment.workDate,
+      shiftId: assignment.shiftId,
+      assignmentKind: assignment.assignmentKind,
+      reason: assignment.reason ?? null,
+      isProtected: assignment.isProtected,
+      hasBaselineOverride: assignment.hasBaselineOverride,
+      baselineOverrideShiftId: assignment.hasBaselineOverride
+        ? draft.assignments.find((candidate) => candidate.employeeId === assignment.employeeId && candidate.workDate === assignment.workDate)?.baselineOverrideShiftId ?? null
+        : null,
+    }));
+    const candidateValidation = await validateScheduleDraftCandidate({
+      draftId: draft.id,
+      ownerUserId: input.ownerUserId,
+      assignments: candidateAssignments,
+    });
+    const blockers = candidateValidation.introducedBlockers.map((issue) => issue.message);
+    if (draft.isSourceStale) blockers.unshift("Live schedules, overrides, or approved leave changed since this draft was created.");
+    const employeeByIdForWarnings = new Map(activeEmployees.map((employee) => [employee.employeeId, employee]));
+    const preservedWarnings = sequence.preservedCells.map(({ employeeId, workDate, reason }) => {
+      const employee = employeeByIdForWarnings.get(employeeId);
+      return `${employee ? `${employee.firstName} ${employee.lastName} (${employee.employeeCode})` : employeeId} · ${workDate}: ${reason} preserved.`;
+    });
+    const warnings = [
+      ...preservedWarnings,
+      ...candidateValidation.issues.filter((issue) => issue.severity === "WARNING").map((issue) => issue.message),
+      ...(candidateValidation.issues.some((issue) => issue.code === "COVERAGE_RULES_NOT_CONFIGURED")
+        ? ["Staffing coverage rules are not configured; no coverage assumptions were applied."]
+        : []),
+    ].slice(0, 40);
+    return createScheduleProposal({
+      draft,
+      nextAssignments,
+      targetEmployeeIds,
+      sourceMessage: input.sourceMessage,
+      intent,
+      previousOperation: input.previousOperation,
+      conversationId: input.conversationId,
+      ownerUserId: input.ownerUserId,
+      shiftRows,
+      initialWarnings: warnings,
+      blockers,
+      changes,
+      summary: changes.length
+        ? `Review ${changes.length} combined draft change${changes.length === 1 ? "" : "s"} for week ${draft.weekStart}. Plan: ${actionDescriptions.join("; ")}. Changes are validated together; later actions override earlier assignments only for overlapping employees and dates. Applying changes affects this draft only.`
+        : "No draft cells need changing. Existing assignments already match the requested plan.",
+    });
+  }
+
   if (intent.operation === "SWAP_SHIFTS") {
     const sourceMatches = findEmployeeTargets(intent.sourceEmployeeQuery ?? "", activeEmployees);
     if (sourceMatches.length !== 1) {
       return makeClarification({
         title: "Choose first employee",
-        summary: sourceMatches.length > 1 ? `Several employees match “${intent.sourceEmployeeQuery}”. Choose first person for swap.` : `I couldn't find “${intent.sourceEmployeeQuery}” in active draft scope. Check name or code.`,
+        summary: sourceMatches.length > 1 ? "Several active employees match the first person in this swap. Choose the correct person." : "I couldn't match the first person to an active employee in this draft. Check the name or employee code.",
         choices: sourceMatches.length > 1 ? choicesForEmployeeRows(sourceMatches, "SWAP_SOURCE") : undefined,
         selectionMode: sourceMatches.length > 1 ? "single" : undefined,
       });
@@ -1869,7 +2430,7 @@ const prepareScheduleOperation = async (input: {
     if (targetMatches.length !== 1) {
       return makeClarification({
         title: "Choose second employee",
-        summary: targetMatches.length > 1 ? `Several employees match “${intent.targetEmployeeQuery}”. Choose second person for swap.` : `I couldn't find “${intent.targetEmployeeQuery}” in active draft scope. Check name or code.`,
+        summary: targetMatches.length > 1 ? "Several active employees match the second person in this swap. Choose the correct person." : "I couldn't match the second person to an active employee in this draft. Check the name or employee code.",
         choices: targetMatches.length > 1 ? choicesForEmployeeRows(targetMatches, "SWAP_TARGET") : undefined,
         selectionMode: targetMatches.length > 1 ? "single" : undefined,
       });
@@ -1946,12 +2507,25 @@ const prepareScheduleOperation = async (input: {
     return makeClarification({ title: "Choose dates in this week", summary: `${outsideDates.join(", ")} is outside displayed draft week ${draft.weekStart}. Choose dates from active planner week or switch planner week.`, choices: options, selectionMode: "multiple", targetEmployeeIds });
   }
   if (uniqueDates.length === 0 && intent.operation === "ASSIGN_SHIFT") {
-    const options = datesInWeek.map((date) => newOperationChoice(
-      `${new Intl.DateTimeFormat("en", { weekday: "long", timeZone: "Asia/Manila" }).format(new Date(`${date}T12:00:00.000Z`))} · ${date}`,
-      undefined,
-      { kind: "DATE", date },
-    ));
-    return makeClarification({ title: "Choose schedule dates", summary: `Which day or days in week ${draft.weekStart} should I update? Select dates below.`, choices: options, selectionMode: "multiple", targetEmployeeIds });
+    if (intent.dateSelectionMode === "PICK_DAYS") {
+      const options = datesInWeek.map((date) => newOperationChoice(
+        `${new Intl.DateTimeFormat("en", { weekday: "long", timeZone: "Asia/Manila" }).format(new Date(`${date}T12:00:00.000Z`))} · ${date}`,
+        undefined,
+        { kind: "DATE", date },
+      ));
+      return makeClarification({ title: "Choose dates", summary: `Select date(s) in planner week ${draft.weekStart}.`, choices: options, selectionMode: "multiple", targetEmployeeIds });
+    }
+    return makeClarification({
+      title: "Choose schedule range",
+      summary: `Choose the date range in planner week ${draft.weekStart}.`,
+      choices: [
+        newOperationChoice("Whole week", "All seven days", { kind: "DATE_SCOPE", scope: "WEEK" }),
+        newOperationChoice("Weekdays only", "Monday through Friday", { kind: "DATE_SCOPE", scope: "WEEKDAYS" }),
+        newOperationChoice("Choose dates", "Pick one or more days", { kind: "DATE_SCOPE", scope: "PICK_DAYS" }),
+      ],
+      selectionMode: "single",
+      targetEmployeeIds,
+    });
   }
   if (uniqueDates.length === 0) {
     return makeClarification({ title: "Choose planner dates", summary: "I couldn't safely resolve requested dates in the displayed planner week. Select dates or edit request.", targetEmployeeIds });
@@ -2047,7 +2621,7 @@ const prepareScheduleOperation = async (input: {
       shiftId: selectedShift.id,
       assignmentKind: nextKind,
       preserveExistingDayOff: intent.operation === "ASSIGN_SHIFT" && intent.preserveExistingDayOff,
-      onlyUnassigned: intent.operation === "ASSIGN_SHIFT" && intent.onlyUnassigned,
+      onlyUnassigned: intent.operation === "ASSIGN_SHIFT" && intent.onlyUnassigned && explicitlyRequestsUnassignedScheduleCells(input.sourceMessage),
     });
     nextAssignments = proposal.assignments;
     const employeeById = new Map(activeEmployees.map((employee) => [employee.employeeId, employee]));
@@ -2419,17 +2993,95 @@ const handleScheduleInteractionAction = async (input: {
     const kinds = new Set(values.map((value) => value.kind));
     if (kinds.size !== 1) throw new ScheduleChatError("Selected options must belong to one choice group.");
     const kind = values[0].kind;
-    let intent = pending.intent;
+    let intent = scheduleOperationIntentSchema.parse(pending.intent);
     let fixedTargetEmployeeIds: string[] | undefined = pending.targetEmployeeIds.length ? pending.targetEmployeeIds : undefined;
+    const updateAction = (actionIndex: number, update: Partial<ScheduleOperationIntent["actions"][number]>) => {
+      if (!Number.isInteger(actionIndex) || actionIndex < 0 || actionIndex >= intent.actions.length) {
+        throw new ScheduleChatError("Scheduling action choice is invalid.");
+      }
+      const actions = [...intent.actions];
+      actions[actionIndex] = { ...actions[actionIndex], ...update };
+      intent = { ...intent, actions };
+    };
     if (kind === "DATE") {
       if (values.some((value) => typeof value.date !== "string")) throw new ScheduleChatError("Date choice is invalid.");
       const dates = values.map((value) => value.date as string);
       if (intent.operation === "SWAP_SHIFTS") {
         if (dates.length > 2) throw new ScheduleChatError("Choose one date for same-day swap, or two dates for different days.");
-        intent = { ...intent, workDates: dates, sourceDate: dates[0] ?? null, targetDate: dates[1] ?? dates[0] ?? null, usePlannerWeek: false };
+        intent = { ...intent, workDates: dates, sourceDate: dates[0] ?? null, targetDate: dates[1] ?? dates[0] ?? null, usePlannerWeek: false, dateSelectionMode: "UNRESOLVED" };
       } else {
-        intent = { ...intent, workDates: dates, usePlannerWeek: false };
+        intent = { ...intent, workDates: dates, usePlannerWeek: false, dateSelectionMode: "UNRESOLVED" };
       }
+    } else if (kind === "DATE_SCOPE") {
+      if (values.length !== 1 || typeof values[0].scope !== "string") throw new ScheduleChatError("Date-range choice is invalid.");
+      const scope = values[0].scope as string;
+      if (scope === "WEEK") intent = { ...intent, workDates: [], usePlannerWeek: true, dateSelectionMode: "UNRESOLVED" };
+      else if (scope === "WEEKDAYS") intent = { ...intent, workDates: weekDatesFor(draft.weekStart).slice(0, 5), usePlannerWeek: false, dateSelectionMode: "UNRESOLVED" };
+      else if (scope === "PICK_DAYS") intent = { ...intent, workDates: [], usePlannerWeek: false, dateSelectionMode: "PICK_DAYS" };
+      else throw new ScheduleChatError("Date-range choice is invalid.");
+    } else if (kind === "ACTION_DATE") {
+      if (values.some((value) => typeof value.date !== "string" || typeof value.actionIndex !== "number") ||
+        new Set(values.map((value) => value.actionIndex)).size !== 1) {
+        throw new ScheduleChatError("Date choices must belong to one scheduling action.");
+      }
+      const actionIndex = values[0].actionIndex as number;
+      const dates = values.map((value) => value.date as string);
+      updateAction(actionIndex, { workDates: dates, usePlannerWeek: false, dateSelectionMode: "UNRESOLVED" });
+    } else if (kind === "ACTION_DATE_SCOPE") {
+      if (values.length !== 1 || typeof values[0].actionIndex !== "number" || typeof values[0].scope !== "string") {
+        throw new ScheduleChatError("Date-range choice is invalid.");
+      }
+      const actionIndex = values[0].actionIndex as number;
+      const scope = values[0].scope as string;
+      if (scope === "WEEK") updateAction(actionIndex, { usePlannerWeek: true, workDates: [], dateSelectionMode: "UNRESOLVED" });
+      else if (scope === "WEEKDAYS") updateAction(actionIndex, { usePlannerWeek: false, workDates: weekDatesFor(draft.weekStart).slice(0, 5), dateSelectionMode: "UNRESOLVED" });
+      else if (scope === "PICK_DAYS") updateAction(actionIndex, { usePlannerWeek: false, workDates: [], dateSelectionMode: "PICK_DAYS" });
+      else throw new ScheduleChatError("Date-range choice is invalid.");
+    } else if (kind === "ACTION_SHIFT") {
+      if (values.length !== 1 || typeof values[0].shiftCode !== "string" || typeof values[0].actionIndex !== "number") {
+        throw new ScheduleChatError("Shift choice is invalid.");
+      }
+      updateAction(values[0].actionIndex as number, { shiftRef: values[0].shiftCode });
+    } else if (kind === "ACTION_EMPLOYEE") {
+      if (values.length !== 1 || typeof values[0].actionIndex !== "number" ||
+        typeof values[0].queryIndex !== "number" || typeof values[0].employeeCode !== "string") {
+        throw new ScheduleChatError("Employee choice is invalid.");
+      }
+      const actionIndex = values[0].actionIndex as number;
+      const queryIndex = values[0].queryIndex as number;
+      const action = intent.actions[actionIndex];
+      if (!action || queryIndex < 0 || (action.targetEmployeeQueries.length > 0 && queryIndex >= action.targetEmployeeQueries.length)) {
+        throw new ScheduleChatError("Employee choice no longer matches this action.", 409);
+      }
+      if (action.targetEmployeeQueries.length > 0) {
+        const queries = [...action.targetEmployeeQueries];
+        queries[queryIndex] = values[0].employeeCode as string;
+        updateAction(actionIndex, { targetType: "EMPLOYEE", targetEmployeeQueries: queries });
+      } else if (queryIndex === 0) {
+        updateAction(actionIndex, { targetType: "EMPLOYEE", targetQuery: values[0].employeeCode as string });
+      } else {
+        throw new ScheduleChatError("Employee choice no longer matches this action.", 409);
+      }
+    } else if (kind === "ACTION_GROUP") {
+      if (values.length !== 1 || typeof values[0].actionIndex !== "number" ||
+        !["POSITION", "DEPARTMENT"].includes(String(values[0].targetType)) || typeof values[0].groupName !== "string") {
+        throw new ScheduleChatError("Group choice is invalid.");
+      }
+      updateAction(values[0].actionIndex as number, {
+        targetType: values[0].targetType as "POSITION" | "DEPARTMENT",
+        targetQuery: values[0].groupName as string,
+      });
+    } else if (kind === "ACTION_EXCLUDED_EMPLOYEE") {
+      if (values.length !== 1 || typeof values[0].actionIndex !== "number" ||
+        typeof values[0].employeeCode !== "string" || typeof values[0].exclusionQuery !== "string") {
+        throw new ScheduleChatError("Employee exclusion choice is invalid.");
+      }
+      const actionIndex = values[0].actionIndex as number;
+      const action = intent.actions[actionIndex];
+      if (!action) throw new ScheduleChatError("Employee exclusion choice no longer matches this action.", 409);
+      updateAction(actionIndex, {
+        excludeTargetQueries: action.excludeTargetQueries.map((query) => query === values[0].exclusionQuery ? values[0].employeeCode as string : query),
+      });
     } else if (kind === "SHIFT") {
       if (values.length !== 1 || typeof values[0].shiftCode !== "string") throw new ScheduleChatError("Shift choice is invalid.");
       intent = { ...intent, shiftRef: values[0].shiftCode };
@@ -2770,10 +3422,7 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
   const userMessage = redactSensitiveText(input.message);
   const bulkSourceMessage = input.bulkSourceMessage ? redactSensitiveText(input.bulkSourceMessage) : userMessage;
   const isBulkAction = Boolean(input.bulkAction);
-  const directGroupShiftIntent = !isBulkAction && !input.interactionAction
-    ? inferExplicitGroupShiftAssignment(userMessage)
-    : null;
-  const provider = isBulkAction || input.interactionAction || directGroupShiftIntent ? null : getProviderConfig();
+  const provider = isBulkAction || input.interactionAction ? null : getProviderConfig();
   const existingConversation = input.conversationId
     ? await db.aiConversation.findFirst({
         where: { id: input.conversationId, userId: input.userId },
@@ -2877,59 +3526,6 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
     };
   }
 
-  if (directGroupShiftIntent) {
-    const actionStartedAt = Date.now();
-    await ensureToolActor(input.userId);
-    let directResult: { message: string; interaction: ScheduleInteraction | null };
-    let outcome: string;
-    try {
-      directResult = await prepareScheduleOperation({
-        conversationId: conversation.id,
-        ownerUserId: input.userId,
-        requestKey: input.requestKey,
-        draftId: conversation.activeDraftId,
-        sourceMessage: userMessage,
-        intent: scheduleOperationIntentSchema.parse(directGroupShiftIntent),
-      });
-      outcome = directResult.interaction?.kind === "PROPOSAL" ? "SUCCEEDED" : "NEEDS_CONFIRMATION";
-    } catch (error) {
-      if (!(error instanceof ScheduleChatError)) throw error;
-      directResult = { message: error.message, interaction: null };
-      outcome = "FAILED";
-    }
-    await appendMessages(conversation.id, input.userId, [{
-      role: AiMessageRole.ASSISTANT,
-      content: directResult.message,
-      replyToRequestKey: input.requestKey,
-    }]);
-    await writeChatAudit({
-      userId: input.userId,
-      conversationId: conversation.id,
-      action: "AI_CHAT_COMPLETED",
-      outcome,
-      metadata: {
-        model: "policy",
-        elapsedMs: Date.now() - actionStartedAt,
-        promptTokens: 0,
-        completionTokens: 0,
-        toolCalls: 1,
-        requestKeyHash: createHash("sha256").update(input.requestKey).digest("hex").slice(0, 16),
-      },
-    });
-    const latestConversation = await db.aiConversation.findFirst({
-      where: { id: conversation.id, userId: input.userId },
-      select: { activeDraftId: true },
-    });
-    return {
-      conversationId: conversation.id,
-      activeDraftId: latestConversation?.activeDraftId ?? conversation.activeDraftId,
-      message: directResult.message,
-      interaction: directResult.interaction ?? undefined,
-      status: "complete" as const,
-      replayed: false,
-    };
-  }
-
   const activeProvider = provider ?? getProviderConfig();
   const previousPending = readPendingSelection(conversation.pendingInteraction);
   const confirmedEmployeeIds = new Set<string>();
@@ -2970,6 +3566,12 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
             ? `${pending.intent.operation} for ${pending.intent.targetQuery ?? pending.intent.targetType}; ${pending.interaction?.summary ?? pending.status}`
             : null;
         })(),
+        pendingOperationDetails: (() => {
+          const pending = readPendingScheduleOperation(conversation.pendingInteraction);
+          return pending && ["CLARIFICATION", "PROPOSAL"].includes(pending.status)
+            ? JSON.stringify({ status: pending.status, intent: pending.intent }).slice(0, 4_000)
+            : null;
+        })(),
       }),
     },
     ...providerHistory(history),
@@ -2978,6 +3580,8 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
   let completionTokens = 0;
   let totalToolCalls = 0;
   let completedToolRound = false;
+  let executedTool = false;
+  let lastToolFeedback = "";
   const startedAt = Date.now();
   let finalMessage = "";
   let finalInteraction: ScheduleInteraction | null = null;
@@ -2986,20 +3590,51 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
   try {
     for (let round = 0; round < MAX_CHAT_TOOL_ROUNDS; round += 1) {
       await ensureToolActor(input.userId);
-      const remainingTokens = MAX_CHAT_COMPLETION_TOKENS - completionTokens;
-      const toolTurnTokens = remainingTokens - MAX_CHAT_FINAL_RESPONSE_TOKENS;
-      if (toolTurnTokens <= 0) {
-        finalMessage = "I reached the response limit for this request. Review the saved draft and continue with another message.";
+      const availableBudget = getCompletionBudget(MAX_CHAT_COMPLETION_TOKENS, completionTokens, MAX_CHAT_FINAL_RESPONSE_TOKENS);
+      if (availableBudget.toolTokens <= 0) break;
+      let completion: Awaited<ReturnType<typeof callOpenRouter>> | null = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const attemptBudget = getCompletionBudget(MAX_CHAT_COMPLETION_TOKENS, completionTokens, MAX_CHAT_FINAL_RESPONSE_TOKENS).toolTokens;
+        if (attemptBudget <= 0) break;
+        let requestMessages = messages;
+        if (attempt === 1) {
+          requestMessages = [...messages];
+          const systemMessage = requestMessages[0];
+          if (systemMessage?.role === "system" && typeof systemMessage.content === "string") {
+            requestMessages[0] = {
+              ...systemMessage,
+              content: `${systemMessage.content}\n\nThe previous provider response was empty, truncated, or invalid. Retry once with one complete native function call that matches its schema, or return a concise actionable clarification. Do not invent database entities.`,
+            };
+          }
+        }
+        completion = await callOpenRouter({
+          ...activeProvider,
+          messages: requestMessages,
+          maxTokens: attempt === 0 ? Math.min(attemptBudget, MAX_CHAT_INITIAL_TOOL_TOKENS) : attemptBudget,
+        });
+        promptTokens += completion.usage.promptTokens;
+        completionTokens += completion.usage.completionTokens || completion.estimatedCompletionTokens;
+        if (!completion.incomplete || executedTool || attempt === 1) break;
+      }
+      if (!completion) {
+        responseStatus = "provider_unavailable";
+        finalMessage = "I ran out of response budget before receiving a complete scheduling answer. No schedule operation ran. Use the planner choices or try a shorter request.";
         break;
       }
-      const completion = await callOpenRouter({ ...activeProvider, messages, maxTokens: toolTurnTokens });
-      promptTokens += completion.usage.promptTokens;
-      completionTokens += completion.usage.completionTokens || completion.estimatedCompletionTokens;
+      if (completion.incomplete) {
+        responseStatus = "provider_unavailable";
+        finalMessage = completion.diagnostics.responseMode.includes("invalid") || completion.diagnostics.responseMode.includes("rejected")
+          ? "OpenRouter returned an invalid scheduling-action format twice. No schedule operation ran. Try a shorter request or use the clickable planner choices."
+          : completion.finishReason === "length"
+            ? "OpenRouter stopped at its output limit before returning a complete scheduling action. No schedule operation ran; shorten the request or use the clickable planner choices."
+            : "OpenRouter returned an empty or incomplete answer twice. No schedule operation ran; use the clickable planner choices or retry once the provider is available.";
+        break;
+      }
       if (completion.calls.length === 0) {
         finalMessage = completion.content.trim();
         if (!finalMessage) {
           responseStatus = "provider_unavailable";
-          finalMessage = "The scheduling assistant returned no usable response. Check the draft for saved changes before retrying; the live schedule was not changed.";
+          finalMessage = "OpenRouter returned no answer. No scheduling operation ran. Use the clickable planner choices or retry once the provider is available.";
         }
         break;
       }
@@ -3011,6 +3646,7 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
       for (let toolIndex = 0; toolIndex < completion.calls.length; toolIndex += 1) {
         const call = completion.calls[toolIndex];
         totalToolCalls += 1;
+        executedTool = true;
         const output = await executeTool({
           ...call,
           ownerUserId: input.userId,
@@ -3027,6 +3663,11 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
         assistantAndToolMessages.push({ role: AiMessageRole.ASSISTANT, content: call.arguments, toolName: call.name, toolCallId: call.id });
         toolResultMessages.push({ role: AiMessageRole.TOOL, content: compact(output), toolName: call.name, toolCallId: call.id });
         providerToolResults.push({ role: "tool", tool_call_id: call.id, content: compact(output) });
+        if (output && typeof output === "object") {
+          const record = output as Record<string, unknown>;
+          if (typeof record.message === "string") lastToolFeedback = record.message;
+          else if (typeof record.error === "string") lastToolFeedback = record.error;
+        }
         if (call.name === "propose_schedule_operation" && output && typeof output === "object") {
           const operationOutput = output as { message?: unknown; interaction?: unknown };
           if (typeof operationOutput.message === "string") finalMessage = operationOutput.message;
@@ -3050,9 +3691,12 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
 
     if (!finalMessage && completedToolRound) {
       await ensureToolActor(input.userId);
-      const remainingTokens = MAX_CHAT_COMPLETION_TOKENS - completionTokens;
-      if (remainingTokens <= 0) {
-        finalMessage = "The scheduling actions ran, but I reached the response limit. Check the draft before continuing; the live schedule was not changed.";
+      const summaryBudget = getCompletionBudget(MAX_CHAT_COMPLETION_TOKENS, completionTokens, MAX_CHAT_FINAL_RESPONSE_TOKENS).finalTokens;
+      if (summaryBudget <= 0) {
+        responseStatus = "provider_unavailable";
+        finalMessage = lastToolFeedback
+          ? `Scheduling step completed: ${lastToolFeedback} I ran out of response budget before summarizing; review the draft before retrying. Live schedule unchanged.`
+          : "The scheduling steps completed, but the response budget ran out before I could summarize them. Review the draft before retrying; live schedule unchanged.";
       } else {
         const finalMessages = [...messages];
         const systemMessage = finalMessages[0];
@@ -3065,27 +3709,32 @@ export async function submitScheduleChat(input: ChatRequest & { userId: string }
         const completion = await callOpenRouter({
           ...activeProvider,
           messages: finalMessages,
-          maxTokens: remainingTokens,
+          maxTokens: summaryBudget,
           allowToolCalls: false,
         });
         promptTokens += completion.usage.promptTokens;
         completionTokens += completion.usage.completionTokens || completion.estimatedCompletionTokens;
-        if (completion.calls.length > 0) {
-          finalMessage = "I reached the scheduling tool limit. Check the draft for saved changes before continuing; the live schedule was not changed.";
+        if (completion.calls.length > 0 || completion.incomplete || !completion.content.trim()) {
+          responseStatus = "provider_unavailable";
+          finalMessage = lastToolFeedback
+            ? `Scheduling step completed: ${lastToolFeedback} I couldn't generate the final summary. Review the draft before retrying; live schedule unchanged.`
+            : "I couldn't generate the final summary. Check the draft for confirmed results before retrying; live schedule unchanged.";
         } else {
           finalMessage = completion.content.trim();
-        }
-        if (!finalMessage) {
-          responseStatus = "provider_unavailable";
-          finalMessage = "The scheduling assistant could not summarize the completed steps. Check the draft before retrying; the live schedule was not changed.";
         }
       }
     }
   } catch (error) {
     if (error instanceof ScheduleChatError && error.status !== 503) throw error;
     if (error instanceof Error && ["Unauthorized", "Forbidden", "AI scheduling is disabled"].includes(error.message)) throw error;
+    console.warn("[AI scheduling chat] Provider orchestration failed", {
+      model: activeProvider.model,
+      requestKeyHash: createHash("sha256").update(input.requestKey).digest("hex").slice(0, 16),
+      errorName: error instanceof Error ? error.name : "UnknownError",
+      ...(error && typeof error === "object" && "code" in error && typeof error.code === "string" ? { errorCode: error.code } : {}),
+    });
     responseStatus = "provider_unavailable";
-    finalMessage = "Scheduling assistant is temporarily unavailable. Your saved draft and manual planner controls remain available; try again later.";
+    finalMessage = "Scheduling assistant is temporarily unavailable. No live schedule changes were made. Check for a saved draft proposal before retrying; manual planner controls remain available.";
   }
 
   await appendMessages(conversation.id, input.userId, [{

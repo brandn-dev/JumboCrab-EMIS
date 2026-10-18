@@ -18,6 +18,7 @@ type ChatMessage = {
   createdAt: string;
   quickActions?: BulkQuickAction[];
   actionRequest?: string;
+  interaction?: ScheduleInteraction;
 };
 
 type ScheduleInteractionChoice = { id: string; label: string; description?: string };
@@ -28,7 +29,7 @@ type ScheduleInteraction = {
   summary: string;
   selectionMode?: "single" | "multiple";
   options?: ScheduleInteractionChoice[];
-  changes?: Array<{ employeeCode: string; employeeName: string; workDate: string; before: string; after: string }>;
+  changes?: Array<{ employeeCode: string; employeeName: string; workDate: string; before: string; after: string; planLabel?: string }>;
   changeCount?: number;
   changesTruncated?: boolean;
   warnings?: string[];
@@ -156,6 +157,14 @@ export function ScheduleAssistantPanel({
         }
         if (cancelled) return;
         let restoredMessages = result.data.messages ?? [];
+        if (result.data.interaction) {
+          const lastAssistantIndex = restoredMessages.map((message) => message.role).lastIndexOf("ASSISTANT");
+          if (lastAssistantIndex >= 0) {
+            restoredMessages = restoredMessages.map((message, index) => index === lastAssistantIndex
+              ? { ...message, interaction: result.data!.interaction! }
+              : message);
+          }
+        }
         const storedActions = window.localStorage.getItem(actionStorageKey);
         if (storedActions) {
           try {
@@ -265,6 +274,7 @@ export function ScheduleAssistantPanel({
       const assistantMessage = makeMessage("ASSISTANT", result.message!, {
         quickActions: result.quickActions?.length ? result.quickActions : undefined,
         actionRequest: action?.sourceMessage ?? normalizedMessage,
+        interaction: result.interaction,
       });
       if (assistantMessage.quickActions?.length) {
         window.localStorage.setItem(actionStorageKey, JSON.stringify({
@@ -371,19 +381,22 @@ export function ScheduleAssistantPanel({
             <p className="text-sm text-muted-foreground">
               Ask about this week’s draft, request a draft change, or ask for a validation. Assistant cannot approve or publish.
             </p>
-          ) : messages.map((message) => (
+          ) : messages.map((message) => {
+            const interaction = message.interaction;
+            return (
             <div key={message.id} className={`flex gap-2 ${message.role === "USER" ? "justify-end" : "justify-start"}`}>
               {message.role === "ASSISTANT" ? <Bot className="mt-1 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" /> : null}
               <div className={`max-w-[90%] rounded-lg px-3 py-2 text-sm ${message.role === "USER" ? "bg-primary text-primary-foreground" : "bg-background"}`}>
                 <p className="whitespace-pre-wrap">{message.content}</p>
                 {message.role === "ASSISTANT" && message.quickActions?.length ? (
-                  <div role="group" aria-label="Scheduling choices" className="mt-3 flex flex-wrap gap-2">
+                  <div role="group" aria-label="Scheduling choices" className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
                     {message.quickActions.map((action) => (
                       <Button
                         key={action.id}
                         type="button"
                         size="sm"
                         variant={action.id === "confirm" || action.id === "all_week" ? "default" : "outline"}
+                        className="w-full sm:w-auto"
                         disabled={sending || loadingHistory}
                         onClick={() => handleQuickAction(action, message.actionRequest ?? "")}
                       >
@@ -392,10 +405,54 @@ export function ScheduleAssistantPanel({
                     ))}
                   </div>
                 ) : null}
+                {message.role === "ASSISTANT" && interaction !== undefined && interaction.id === activeInteraction?.id && interaction.kind === "CLARIFICATION" && interaction.options?.length ? (
+                  <div role="group" aria-label="Choose scheduling option" className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                    {interaction.options.map((option) => {
+                      const selected = selectedInteractionOptionIds.includes(option.id);
+                      return (
+                        <Button
+                          key={option.id}
+                          type="button"
+                          size="sm"
+                          variant={selected ? "default" : "outline"}
+                          className="h-auto min-h-10 w-full whitespace-normal text-left sm:w-auto"
+                          aria-pressed={selected}
+                          disabled={sending || loadingHistory}
+                          onClick={() => {
+                            if (interaction.selectionMode === "multiple") {
+                              setSelectedInteractionOptionIds((current) => selected
+                                ? current.filter((id) => id !== option.id)
+                                : [...current, option.id]);
+                            } else {
+                              handleInteractionAction("select", [option.id]);
+                            }
+                          }}
+                        >
+                          <span className="text-left">
+                            {option.label}
+                            {option.description ? <span className="block text-xs font-normal opacity-80">{option.description}</span> : null}
+                          </span>
+                        </Button>
+                      );
+                    })}
+                    {interaction.selectionMode === "multiple" ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="w-full sm:w-auto"
+                        disabled={selectedInteractionOptionIds.length === 0 || sending || loadingHistory}
+                        onClick={() => handleInteractionAction("select", selectedInteractionOptionIds)}
+                      >
+                        Continue with {selectedInteractionOptionIds.length || "selected"}
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
               {message.role === "USER" ? <UserRound className="mt-1 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" /> : null}
             </div>
-          ))}
+            );
+          })}
           {sending ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> Checking schedule context…
@@ -411,60 +468,26 @@ export function ScheduleAssistantPanel({
               </div>
               <Badge variant={activeInteraction.kind === "PROPOSAL" ? "secondary" : "outline"}>{activeInteraction.kind.toLowerCase()}</Badge>
             </div>
-            {activeInteraction.options?.length ? (
-              <div role="group" aria-label="Choose scheduling option" className="flex flex-wrap gap-2">
-                {activeInteraction.options.map((option) => {
-                  const selected = selectedInteractionOptionIds.includes(option.id);
-                  return (
-                    <Button
-                      key={option.id}
-                      type="button"
-                      size="sm"
-                      variant={selected ? "default" : "outline"}
-                      aria-pressed={selected}
-                      disabled={sending || loadingHistory}
-                      onClick={() => {
-                        if (activeInteraction.selectionMode === "multiple") {
-                          setSelectedInteractionOptionIds((current) => selected
-                            ? current.filter((id) => id !== option.id)
-                            : [...current, option.id]);
-                        } else {
-                          handleInteractionAction("select", [option.id]);
-                        }
-                      }}
-                    >
-                      <span className="text-left">
-                        {option.label}
-                        {option.description ? <span className="block text-xs font-normal opacity-80">{option.description}</span> : null}
-                      </span>
-                    </Button>
-                  );
-                })}
-                {activeInteraction.selectionMode === "multiple" ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    disabled={selectedInteractionOptionIds.length === 0 || sending || loadingHistory}
-                    onClick={() => handleInteractionAction("select", selectedInteractionOptionIds)}
-                  >
-                    Continue with {selectedInteractionOptionIds.length || "selected"}
-                  </Button>
-                ) : null}
-              </div>
-            ) : null}
             {activeInteraction.changes?.length ? (
               <div className="max-h-52 overflow-y-auto rounded-md border bg-background p-2">
                 <p className="mb-2 text-xs font-medium">{activeInteraction.changeCount ?? activeInteraction.changes.length} proposed cell changes</p>
                 <ul className="space-y-1 text-xs">
-                  {activeInteraction.changes.slice(0, 20).map((change, index) => (
+                  {activeInteraction.changes.map((change, index) => (
                     <li key={`${change.employeeCode}-${change.workDate}-${index}`} className="grid gap-1 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
-                      <span>{change.employeeName} · {change.employeeCode} · {change.workDate}</span>
+                      <span>
+                        {change.employeeName} · {change.employeeCode} · {change.workDate}
+                        {change.planLabel ? <span className="block text-muted-foreground">{change.planLabel}</span> : null}
+                      </span>
                       <span aria-hidden="true">→</span>
                       <span>{change.before} → {change.after}</span>
                     </li>
                   ))}
                 </ul>
-                {activeInteraction.changesTruncated ? <p className="mt-2 text-xs text-muted-foreground">Showing first 20 changes. Review all affected cells in draft after apply.</p> : null}
+                {activeInteraction.changesTruncated || activeInteraction.changes.length > 20 ? (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Showing up to 100 representative changes across each requested action group. Review full draft after apply.
+                  </p>
+                ) : null}
               </div>
             ) : null}
             {activeInteraction.blockers?.length ? (

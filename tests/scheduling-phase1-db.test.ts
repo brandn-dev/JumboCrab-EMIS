@@ -6,6 +6,7 @@ import { getPrismaClient } from "../src/lib/prisma";
 import {
   createScheduleDraft,
   discardScheduleDraft,
+  discardScheduleDraftsForWeek,
   getScheduleDraftVersion,
   listScheduleDraftsForWeek,
   saveScheduleDraftVersion,
@@ -232,4 +233,13 @@ test("draft creation, edits, idempotency, staleness, and discard never write liv
   await discardScheduleDraft({ draftId: reference.id, ownerUserId });
   const discarded = await getScheduleDraftVersion({ draftId: reference.id, ownerUserId });
   assert.equal(discarded.status, "DISCARDED");
+  const historyAfterSingleDiscard = await listScheduleDraftsForWeek({ weekStart: "2026-10-19", ownerUserId });
+  assert.equal(historyAfterSingleDiscard.some((group) => group.latest.lineageId === discarded.lineageId), false);
+
+  const bulkResult = await discardScheduleDraftsForWeek({ weekStart: "2026-10-19", ownerUserId });
+  assert.equal(bulkResult.discardedCount, 1);
+  const historyAfterBulkDiscard = await listScheduleDraftsForWeek({ weekStart: "2026-10-19", ownerUserId });
+  assert.equal(historyAfterBulkDiscard.length, 0);
+  const discardedCurrent = await getScheduleDraftVersion({ draftId: version2.id, ownerUserId });
+  assert.equal(discardedCurrent.status, "DISCARDED");
 });

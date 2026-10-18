@@ -73,7 +73,8 @@ type WeekPlannerSectionProps = {
   onDraftVersionChange: (draftId: string) => void;
   onCreateDraft: (sourceMode: "CURRENT_SCHEDULE" | "REFERENCE_WEEK" | "EMPTY") => void;
   onDraftGenerated: (draft: ScheduleDraftDetails) => void;
-  onDiscardDraft: () => void;
+  onDiscardDraft: () => void | Promise<void>;
+  onDiscardAllDrafts: () => void | Promise<void>;
   onWeekStartChange: (value: string) => void;
   onCompareWeekStartChange: (value: string) => void;
   onDepartmentChange: (value: string) => void;
@@ -243,6 +244,7 @@ export function WeekPlannerSection({
   onCreateDraft,
   onDraftGenerated,
   onDiscardDraft,
+  onDiscardAllDrafts,
   onWeekStartChange,
   onCompareWeekStartChange,
   onDepartmentChange,
@@ -296,6 +298,7 @@ export function WeekPlannerSection({
     Array<{ id: string; leftShiftId: string; rightShiftId: string }>
   >([{ id: "0", leftShiftId: "", rightShiftId: "" }]);
   const [alternateError, setAlternateError] = useState<string | null>(null);
+  const [discardDialogMode, setDiscardDialogMode] = useState<"selected" | "all" | null>(null);
 
   const shiftsById = useMemo(
     () => new Map(shifts.map((shift) => [shift.id, shift] as const)),
@@ -821,6 +824,10 @@ export function WeekPlannerSection({
     () => draftGroups.flatMap((group) => group.versions),
     [draftGroups],
   );
+  const discardableDraftCount = useMemo(
+    () => draftGroups.filter(({ latest }) => latest.status === "DRAFT" || latest.status === "VALIDATED").length,
+    [draftGroups],
+  );
   const draftAssignmentsByKey = useMemo(
     () => new Map(activeDraft?.assignments.map((assignment) => [
       `${assignment.employeeId}:${assignment.workDate}`,
@@ -935,16 +942,35 @@ export function WeekPlannerSection({
                     <SelectValue placeholder={draftLoading ? "Loading drafts…" : "Draft history"} />
                   </SelectTrigger>
                   <SelectContent>
-                    {draftVersions.map((version) => (
-                      <SelectItem key={version.id} value={version.id}>
-                        {`v${version.version} · ${version.status} · ${version.updatedAt.slice(0, 10)}`}
-                      </SelectItem>
-                    ))}
+                    {draftVersions.map((version) => {
+                      const scopeLabel = version.scope.selectionMode === "ALL"
+                        ? "All staff"
+                        : version.scope.selectionMode === "DEPARTMENT"
+                          ? `Department · ${version.scope.employeeIds.length}`
+                          : `Selected · ${version.scope.employeeIds.length}`;
+                      const createdLabel = new Date(version.createdAt).toLocaleString("en-PH", {
+                        timeZone: "Asia/Manila",
+                        month: "short",
+                        day: "numeric",
+                        hour: "numeric",
+                        minute: "2-digit",
+                      });
+                      return (
+                        <SelectItem key={version.id} value={version.id}>
+                          {`v${version.version} · ${version.status} · ${scopeLabel} · ${version.sourceMode.toLowerCase().replaceAll("_", " ")} · ${createdLabel} · #${version.id.slice(-5)}`}
+                        </SelectItem>
+                      );
+                    })}
                   </SelectContent>
                 </Select>
-                {activeDraft?.isLatestVersion && activeDraft.status === "DRAFT" ? (
-                  <Button type="button" variant="outline" size="sm" onClick={onDiscardDraft} disabled={saving}>
-                    Discard latest draft
+                {activeDraft?.isLatestVersion && (activeDraft.status === "DRAFT" || activeDraft.status === "VALIDATED") ? (
+                  <Button type="button" variant="outline" size="sm" onClick={() => setDiscardDialogMode("selected")} disabled={saving || draftLoading}>
+                    Discard this draft
+                  </Button>
+                ) : null}
+                {discardableDraftCount > 0 ? (
+                  <Button type="button" variant="destructive" size="sm" onClick={() => setDiscardDialogMode("all")} disabled={saving || draftLoading}>
+                    Discard all editable drafts ({discardableDraftCount})
                   </Button>
                 ) : null}
               </div>
@@ -1487,6 +1513,36 @@ export function WeekPlannerSection({
           </div>
         )}
       </CardContent>
+
+      <Dialog open={discardDialogMode !== null} onOpenChange={(open) => { if (!open) setDiscardDialogMode(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{discardDialogMode === "all" ? "Discard all editable drafts?" : "Discard this draft?"}</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            {discardDialogMode === "all"
+              ? `This marks up to ${discardableDraftCount} latest draft lineages for this week as discarded. Approved or published schedules are skipped.`
+              : "This removes the selected draft lineage from the draft history list. Only unapproved drafts can be discarded."}
+            {" "}The live schedule will not change, and the audit history will be retained.
+          </p>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setDiscardDialogMode(null)} disabled={saving}>Cancel</Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={saving}
+              onClick={() => {
+                const mode = discardDialogMode;
+                setDiscardDialogMode(null);
+                if (mode === "all") void onDiscardAllDrafts();
+                else if (mode === "selected") void onDiscardDraft();
+              }}
+            >
+              {discardDialogMode === "all" ? "Discard editable drafts" : "Discard draft"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={pickerOpen} onOpenChange={setPickerOpen}>
         <DialogContent className="max-h-[92vh] w-[96vw] max-w-[96vw] overflow-y-auto sm:max-w-[96vw] 2xl:max-w-[1400px]">

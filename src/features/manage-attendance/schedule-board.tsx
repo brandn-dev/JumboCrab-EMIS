@@ -15,6 +15,7 @@ import {
 import {
   createScheduleDraft,
   discardScheduleDraft,
+  discardScheduleDraftsForWeek,
   getScheduleDraftVersion,
   listScheduleDraftsForWeek,
   saveScheduleDraftVersion,
@@ -794,19 +795,62 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
       setPlannerDraftError(null);
       const result = await discardScheduleDraft({ draftId: currentWeekAIDraft.id });
       if (!result.success) throw new Error(result.error || "Failed to discard draft");
-      setPlannerActiveDraft(null);
+      const listResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+      if (!listResult.success) throw new Error(listResult.error || "Failed to refresh draft history");
+      setPlannerDraftGroups(listResult.data);
       setPlannerAIDraftShiftMaps((previous) => {
         const next = { ...previous };
         delete next[currentWeekAIDraft.id];
         return next;
       });
-      const listResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
-      if (listResult.success) setPlannerDraftGroups(listResult.data);
-      toast.success("Draft discarded.");
+      const nextDraftSummary = listResult.data[0]?.latest;
+      if (nextDraftSummary) {
+        const nextDraft = await getScheduleDraftVersion({ draftId: nextDraftSummary.id });
+        if (nextDraft.success) setActivePlannerDraft(nextDraft.data);
+        else setPlannerActiveDraft(null);
+      } else {
+        setPlannerActiveDraft(null);
+      }
+      toast.success("Draft discarded and removed from draft history.");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to discard draft";
       setPlannerDraftError(message);
       toast.error("Failed to discard draft.", { description: message });
+    } finally {
+      setPlannerSaving(false);
+    }
+  };
+
+  const handlePlannerDraftsDiscard = async () => {
+    try {
+      setPlannerSaving(true);
+      setPlannerDraftError(null);
+      const result = await discardScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+      if (!result.success) throw new Error(result.error || "Failed to discard drafts");
+      const listResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+      if (!listResult.success) throw new Error(listResult.error || "Failed to refresh draft history");
+      setPlannerDraftGroups(listResult.data);
+      const remainingIds = new Set(listResult.data.flatMap((group) => group.versions.map((version) => version.id)));
+      setPlannerAIDraftShiftMaps((previous) => Object.fromEntries(
+        Object.entries(previous).filter(([draftId]) => remainingIds.has(draftId)),
+      ));
+      if (!plannerActiveDraft || !remainingIds.has(plannerActiveDraft.id)) {
+        const nextDraftSummary = listResult.data[0]?.latest;
+        if (nextDraftSummary) {
+          const nextDraft = await getScheduleDraftVersion({ draftId: nextDraftSummary.id });
+          if (nextDraft.success) setActivePlannerDraft(nextDraft.data);
+          else setPlannerActiveDraft(null);
+        } else {
+          setPlannerActiveDraft(null);
+        }
+      }
+      toast.success(`${result.data.discardedCount} draft lineage(s) discarded.`, {
+        description: "They are removed from this week's draft list. Live schedules and audit history are unchanged.",
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to discard drafts";
+      setPlannerDraftError(message);
+      toast.error("Failed to discard drafts.", { description: message });
     } finally {
       setPlannerSaving(false);
     }
@@ -1436,6 +1480,7 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
           onCreateDraft={handlePlannerDraftCreate}
           onDraftGenerated={handlePlannerDraftGenerated}
           onDiscardDraft={handlePlannerDraftDiscard}
+          onDiscardAllDrafts={handlePlannerDraftsDiscard}
           onWeekStartChange={setPlannerWeekStart}
           onCompareWeekStartChange={setPlannerCompareWeekStart}
           onDepartmentChange={setPlannerDepartmentId}

@@ -15,14 +15,76 @@ export const MAX_CHAT_MESSAGE_LENGTH = 2_000;
 export const MAX_CHAT_HISTORY_MESSAGES = 40;
 export const MAX_CHAT_TOOL_ROUNDS = 5;
 export const MAX_CHAT_TOOL_CALLS_PER_TURN = 5;
-export const MAX_CHAT_COMPLETION_TOKENS = 3_000;
-export const MAX_CHAT_FINAL_RESPONSE_TOKENS = 400;
+export const MAX_CHAT_COMPLETION_TOKENS = 5_000;
+export const MAX_CHAT_FINAL_RESPONSE_TOKENS = 600;
+export const MAX_CHAT_INITIAL_TOOL_TOKENS = 2_400;
 export const MAX_CHAT_MESSAGES_PER_DAY = 120;
 export const MAX_CHAT_MESSAGES_PER_MINUTE = 8;
 export const MAX_CHAT_MESSAGES_PER_CONVERSATION = 200;
 export const MAX_CHAT_TOOL_RESULT_CHARS = 12_000;
 
 export type TextualProviderToolCall = { name: string; arguments: string };
+export type ValidatedProviderToolCall = { id: string; name: string; arguments: string };
+
+export function getCompletionBudget(totalTokens: number, usedTokens: number, finalReservation: number) {
+  const remainingTokens = Math.max(0, totalTokens - usedTokens);
+  return {
+    remainingTokens,
+    toolTokens: Math.max(0, remainingTokens - finalReservation),
+    finalTokens: Math.min(remainingTokens, finalReservation),
+  };
+}
+
+export function shouldRetryIncompleteCompletion(input: {
+  finishReason: string | null;
+  content: string;
+  validToolCallCount: number;
+  rejectedToolCallCount: number;
+}) {
+  if (input.finishReason === "length") return true;
+  if (input.validToolCallCount > 0) return false;
+  return input.rejectedToolCallCount > 0 || input.content.trim().length === 0;
+}
+
+export function validateProviderToolCalls(input: {
+  value: unknown;
+  allowedToolNames: readonly string[];
+  maxCalls: number;
+}) {
+  const rawCalls = Array.isArray(input.value) ? input.value : [];
+  const overflow = rawCalls.length > input.maxCalls;
+  const calls: ValidatedProviderToolCall[] = [];
+  let rejectedCount = overflow ? rawCalls.length - input.maxCalls : input.value == null || Array.isArray(input.value) ? 0 : 1;
+  for (const entry of rawCalls.slice(0, input.maxCalls)) {
+    if (!entry || typeof entry !== "object") {
+      rejectedCount += 1;
+      continue;
+    }
+    const call = entry as Record<string, unknown>;
+    const fn = call.function && typeof call.function === "object" ? call.function as Record<string, unknown> : null;
+    const rawArguments = fn && (typeof fn.arguments === "string" || (fn.arguments && typeof fn.arguments === "object"))
+      ? typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments)
+      : null;
+    let decoded: unknown = null;
+    try {
+      decoded = rawArguments ? JSON.parse(rawArguments) as unknown : null;
+    } catch {
+      rejectedCount += 1;
+      continue;
+    }
+    if (
+      typeof call.id !== "string" || call.id.length > 120 ||
+      !fn || typeof fn.name !== "string" || !input.allowedToolNames.includes(fn.name) ||
+      !rawArguments || rawArguments.length > 8_000 ||
+      !decoded || typeof decoded !== "object" || Array.isArray(decoded)
+    ) {
+      rejectedCount += 1;
+      continue;
+    }
+    calls.push({ id: call.id, name: fn.name, arguments: rawArguments });
+  }
+  return { calls, rawCallCount: rawCalls.length, rejectedCount, overflow };
+}
 
 export const sanitizeSchedulingAssistantMessage = (content: string) => {
   const hasMarkupToolCall = /<tool_call\s*>|<function\s*=|<parameter\s*=/i.test(content);
@@ -151,53 +213,6 @@ export function parseTextualProviderToolCalls(input: {
   return { detected: true, calls };
 }
 
-export function shouldUsePlannerWeekForShiftAssignment(message: string) {
-  const explicitDate = /\b(?:monday|mon|tuesday|tue|tues|wednesday|wed|thursday|thu|thur|thurs|friday|fri|saturday|sat|sunday|sun|today|tomorrow)\b|\b\d{4}-\d{2}-\d{2}\b|\b(?:january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+\d{1,2}\b/i.test(message);
-  const requestsWholeWeek = /\b(?:this|next|whole|entire|all)\s+week\b|\b(?:every|each)\s+day\b/i.test(message);
-  const requestsAllShifts = /\b(?:all|every|each)\b[\w\s'-]{0,60}\bshifts?\b/i.test(message);
-  const requestsUnassignedShifts = /\bunassigned\s+shifts?\b/i.test(message);
-  return !explicitDate && (requestsWholeWeek || requestsAllShifts || requestsUnassignedShifts);
-}
-
-export function inferSchedulingAssignmentTarget(message: string) {
-  const explicitlyAllStaff = /\b(?:all\s+(?:the\s+)?(?:employees?|staff|team)|every(?:one|body|\s+employee|\s+staff))\b/i.test(message);
-  if (explicitlyAllStaff) return null;
-  if (/\bcashier\s+(?:department|dept)\b/i.test(message)) return { targetType: "DEPARTMENT" as const, targetQuery: "Cashier" };
-  const cashierGroup = /\b(?:all|every|each)\s+(?:the\s+)?cashiers?\b|\bcashiers?\s+shifts?\b|\bcashier\s+team\b|\bunassigned\s+shifts?\s+(?:of|for)\s+cashiers?\b/i.test(message);
-  return cashierGroup ? { targetType: "POSITION" as const, targetQuery: "Cashier" } : null;
-}
-
-export function inferExplicitGroupShiftAssignment(message: string) {
-  const requestsChange = /\b(?:set|assign|change|switch|move|update|make)\b/i.test(message);
-  const mentionsShift = /\bshifts?\b/i.test(message);
-  const target = inferSchedulingAssignmentTarget(message);
-  if (!requestsChange || !mentionsShift || !target) return null;
-  return {
-    operation: "ASSIGN_SHIFT" as const,
-    targetType: target.targetType,
-    targetQuery: target.targetQuery,
-    targetEmployeeQueries: [],
-    excludeTargetQueries: [],
-    shiftRef: null,
-    workDates: [],
-    usePlannerWeek: shouldUsePlannerWeekForShiftAssignment(message),
-    preserveExistingDayOff: shouldPreserveExistingDayOff(message),
-    onlyUnassigned: /\bunassigned\b/i.test(message),
-    dayOffCount: null,
-    minimumOnly: false,
-    noDayOffWeekdays: [],
-    sourceEmployeeQuery: null,
-    targetEmployeeQuery: null,
-    sourceDate: null,
-    targetDate: null,
-  };
-}
-
-export function shouldPreserveExistingDayOff(message: string) {
-  return /\b(?:keep|preserve|leave|retain|don['’]?t\s+(?:change|move|touch|replace)|do\s+not\s+(?:change|move|touch|replace))\b[\w\s'-]{0,40}\b(?:current\s+)?day\s+offs?\b/i.test(message) ||
-    /\b(?:day\s+offs?|offs?)\b[\w\s'-]{0,40}\b(?:unchanged|the\s+same|as\s+is)\b/i.test(message);
-}
-
 const isMondayDate = (value: string) => {
   const [year, month, day] = value.split("-").map(Number);
   const parsed = new Date(Date.UTC(year, month - 1, day, 12));
@@ -248,6 +263,26 @@ export type EmployeeSelectionCandidate = {
   displayName: string;
 };
 
+export function matchesScheduleEmployeeQuery(query: string, employee: {
+  employeeId: string;
+  employeeCode: string;
+  firstName: string;
+  lastName: string;
+}) {
+  const trimmedQuery = query.trim();
+  const normalizedQuery = trimmedQuery.toLocaleLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const fullName = `${employee.firstName} ${employee.lastName}`.toLocaleLowerCase();
+  const reverseName = `${employee.lastName} ${employee.firstName}`.toLocaleLowerCase();
+
+  // Internal IDs are accepted only as an exact server-side match, for compatibility
+  // with older model-visible tool results. Never display them to the manager.
+  return employee.employeeId === trimmedQuery ||
+    employee.employeeCode.toLocaleLowerCase() === trimmedQuery.toLocaleLowerCase() ||
+    fullName === normalizedQuery || reverseName === normalizedQuery ||
+    fullName.includes(normalizedQuery) || reverseName.includes(normalizedQuery) ||
+    fullName.split(/\s+/).some((part) => part === normalizedQuery);
+}
+
 export type ShiftReferenceCandidate = {
   id: number;
   code: string;
@@ -293,7 +328,7 @@ export function resolveShiftReference(
 }
 
 export function extractShiftReferenceFromMessage(message: string, candidates: ShiftReferenceCandidate[]) {
-  const reference = message.match(/\bshift(?:\s+code)?(?:\s+(?:to|is)\s+|\s*[=:]\s*|\s+)([a-z0-9][a-z0-9_-]*)\b/i)?.[1];
+  const reference = message.match(/\bshift(?:\s+code)?(?:\s+(?:(?:to|is|be)\s+)*|\s*[=:]\s*)([a-z0-9][a-z0-9_-]*)\b/i)?.[1];
   if (reference) return resolveShiftReference(reference, candidates);
 
   const mentionedCodes = candidates.filter((candidate) => {
@@ -325,6 +360,10 @@ export function isExplicitBulkScheduleRequest(message: string) {
   const requestsScheduleChange = /\b(?:set|assign|change|switch|move|put|give|make|update)\b/i.test(message) &&
     /\b(?:shift|schedule|day\s+off|off)\b/i.test(message);
   return requestsBulkScope && requestsScheduleChange;
+}
+
+export function explicitlyRequestsUnassignedScheduleCells(message: string) {
+  return /\bunassigned\b/i.test(message);
 }
 
 export function needsBulkScheduleDateClarification(message: string) {
@@ -486,23 +525,27 @@ export function buildSchedulingChatSystemPrompt(todayManila: string, context?: {
   scope?: { departmentId?: string | null; selectedEmployeeCount?: number };
   activeDraft?: { id: string; version: number; status: string; isSourceStale: boolean } | null;
   pendingOperationSummary?: string | null;
+  pendingOperationDetails?: string | null;
 }) {
   const lines = [
     "You are JumboCrab EMIS's manager-only weekly scheduling assistant.",
     `Today is ${todayManila} in Asia/Manila. Weeks run Monday through Sunday.`,
     "Use only facts returned by the scheduling tools. Do not invent staffing, rest, hours, or eligibility policies; say Not configured when absent.",
-    "Interpret ordinary conversational English, Filipino, or mixed phrasing. Resolve all names, roles, departments, dates, and shifts using authorized tool results. Never invent entities or IDs.",
+    "Interpret ordinary conversational English, Filipino, or mixed phrasing. Resolve all names, roles, departments, dates, and shifts using authorized tool results. Never invent entities or IDs. Employee tool results show names and employee codes only: use those exact human-readable values in employee queries; never use or output database IDs.",
     "You may read context and propose changes to an isolated schedule draft. Never write schedule cells yourself and never claim a live schedule changed. Use propose_schedule_operation for requested assignments, day-off plans, and swaps; server validates and previews before a manager can apply changes to the draft.",
     "Approval and publication are not available to you. Refuse requests to publish, approve, or bypass validation.",
     "Before changing a cell, ensure the target draft, employee, and date are known. Ask only when one is missing or the employee name is ambiguous; then show employee codes and wait for the manager to choose. Never guess the employee identity.",
     "Never ask the manager for a database shift ID.",
     "Resolve shifts from active shift options by code or name. Use Shift.isDayOff=true to find day-off shifts. Never ask the manager for a database shift ID.",
     "For working shift assignments, include the exact shift code or shift name as shiftRef (for example, manager saying 'shift 2' means resolve active code 2). If no unique shift matches, return a clickable shift choice.",
-    "Combine group, shift, date, and preservation details into one propose_schedule_operation call; the server resolves employees, roles, and shift codes. Do not make one call per employee or date for a group request.",
+    "Return one propose_schedule_operation call per scheduling request. Include every distinct requested group and assignment as an ordered action; action-level target scopes may differ. Never replace named groups with only unassigned employees. Later actions override earlier ones only for overlapping employees and dates.",
+    "For 'cashiers PM, half the cooks AM and half PM, rest MID', create four whole-week WORK actions: POSITION Cashier to PM; POSITION Cook to AM and POSITION Cook to PM with the same allocationGroup on both; then ALL to MID with excludeTargetQueries [Cashier, Cook]. The server splits cooks into balanced, stable groups. Do not use onlyUnassigned unless the manager explicitly says unassigned.",
+    "For weekly planner requests without named dates, use the selected planner week and set usePlannerWeek=true on each action. For multi-scope plans, keep the proposal-level target as ALL and set each action's own targetType and targetQuery.",
     "For requests like 'set all cashier shifts to PM', target the matching POSITION, resolve the active PM shift, and set usePlannerWeek=true when no specific date is named. If manager says keep or do not change current day off, set preserveExistingDayOff=true; server will retain each existing DAY_OFF cell and propose PM only on other requested days. If manager says unassigned shifts, set onlyUnassigned=true so every already assigned shift and day off stays unchanged.",
     "For day-off planning, default to exactly one OFF assignment per person in the selected planner week unless the manager says at least one. Use the active Shift definition with isDayOff=true. Preserve existing compliant OFF assignments. Never replace protected leave, overrides, extra OFF assignments, or locked/published schedules with an invented working shift.",
     "For group requests, identify whether target is all, a position, a department, or named employee. 'Cashiers' usually means position; use database position and department relationships to resolve it. Respect exclusions such as 'except managers'. If target is ambiguous, propose a clarification instead of guessing.",
     "For multiple individually named employees, put each separate name or code in targetEmployeeQueries. Resolve every name inside active draft scope; do not combine names into one query string.",
+    "For corrections like 'make it Friday instead', use the pending operation context and return a complete revised plan, retaining every prior action except the detail the manager corrected. Never create a second partial proposal.",
     "A one-off restriction such as 'no cashier OFF Sunday' applies only to the day-off proposal being discussed unless a manager explicitly asks to configure a standing policy. Do not invent or persist company policy.",
     "Use the displayed planner week in context for 'this week'. Include exact returned dates in proposed operations. Ask when the date or scope cannot be safely resolved.",
     "Resolve a weekday from the selected planner week: a weekday alone means exactly that date in that week. Do not add dates from another week or change multiple dates unless the manager explicitly asks.",
@@ -527,5 +570,6 @@ export function buildSchedulingChatSystemPrompt(todayManila: string, context?: {
   if (context?.pendingOperationSummary) {
     lines.push(`Pending manager operation: ${context.pendingOperationSummary}. Interpret follow-up corrections as edits to this operation. Do not apply it; return a revised structured proposal.`);
   }
+  if (context?.pendingOperationDetails) lines.push(`Pending plan details: ${context.pendingOperationDetails}`);
   return lines.join("\n");
 }

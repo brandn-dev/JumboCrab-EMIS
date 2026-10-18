@@ -6,6 +6,7 @@ import { requireAiSchedulingEnabled } from "@/lib/ai-scheduling-feature";
 import {
   createScheduleDraft as createScheduleDraftImpl,
   discardScheduleDraft as discardScheduleDraftImpl,
+  discardScheduleDraftsForWeek as discardScheduleDraftsForWeekImpl,
   getScheduleDraftVersion as getScheduleDraftVersionImpl,
   listScheduleDraftsForWeek as listScheduleDraftsForWeekImpl,
   saveScheduleDraftVersion as saveScheduleDraftVersionImpl,
@@ -101,5 +102,19 @@ export async function discardScheduleDraft(input: { draftId: string }) {
     return { success: true as const };
   } catch (error) {
     return { success: false as const, error: draftActionError(error, "Failed to discard schedule draft") };
+  }
+}
+
+export async function discardScheduleDraftsForWeek(input: { weekStart: string }) {
+  try {
+    const actor = await requireScheduleManager();
+    requireAiSchedulingEnabled();
+    const data = await discardScheduleDraftsForWeekImpl({
+      weekStart: input?.weekStart,
+      ownerUserId: actor.userId,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return { success: false as const, error: draftActionError(error, "Failed to discard schedule drafts") };
   }
 }

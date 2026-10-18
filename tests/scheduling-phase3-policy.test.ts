@@ -5,6 +5,7 @@ import {
   MAX_CHAT_COMPLETION_TOKENS,
   MAX_CHAT_FINAL_RESPONSE_TOKENS,
   MAX_CHAT_HISTORY_MESSAGES,
+  MAX_CHAT_INITIAL_TOOL_TOKENS,
   MAX_CHAT_MESSAGE_LENGTH,
   MAX_CHAT_MESSAGES_PER_CONVERSATION,
   MAX_CHAT_MESSAGES_PER_DAY,
@@ -14,31 +15,38 @@ import {
   MAX_CHAT_TOOL_ROUNDS,
   buildSchedulingChatSystemPrompt,
   chatRequestSchema,
+  explicitlyRequestsUnassignedScheduleCells,
+  getCompletionBudget,
   isAiSchedulingChatEnabled,
   parseTextualProviderToolCalls,
   sanitizeSchedulingAssistantMessage,
   extractShiftReferenceFromMessage,
   isExplicitBulkScheduleRequest,
-  inferExplicitGroupShiftAssignment,
-  inferSchedulingAssignmentTarget,
+  matchesScheduleEmployeeQuery,
   needsBulkScheduleDateClarification,
   redactSensitiveText,
   requiresEmployeeSelectionConfirmation,
   resolveExplicitEmployeeSelection,
   resolveExplicitBulkScheduleDates,
   resolveShiftReference,
-  shouldPreserveExistingDayOff,
-  shouldUsePlannerWeekForShiftAssignment,
+  shouldRetryIncompleteCompletion,
+  validateProviderToolCalls,
 } from "../src/lib/ai-scheduling-chat-policy";
 import {
   applyShiftAssignmentProposal,
+  applyScheduleAssignmentSequence,
+  containsNaturalGroupName,
+  inferScheduleActionScopesFromText,
   distributeDayOffAssignments,
   canApplyScheduleOperation,
   isScheduleOperationExpired,
   isValidScheduleOperationSelection,
   matchesNaturalGroupName,
   matchesScheduleOperationDraftVersion,
+  mergePendingScheduleIntent,
   scheduleOperationIntentSchema,
+  selectRepresentativeScheduleChanges,
+  splitEmployeesEvenly,
 } from "../src/lib/ai-scheduling-operation-policy";
 
 test("chat stays disabled unless both scheduling and chat flags are explicitly enabled", () => {
@@ -116,6 +124,20 @@ test("ambiguous names need explicit employee-code or numbered selection", () => 
   }), false);
 });
 
+test("employee target matching accepts human identifiers and exact legacy database IDs", () => {
+  const employee = {
+    employeeId: "cmomo2r5k0033ptxch73uy80i",
+    employeeCode: "JC-042",
+    firstName: "Debbie",
+    lastName: "Considine",
+  };
+  assert.equal(matchesScheduleEmployeeQuery("Debbie Considine", employee), true);
+  assert.equal(matchesScheduleEmployeeQuery("considine debbie", employee), true);
+  assert.equal(matchesScheduleEmployeeQuery("JC-042", employee), true);
+  assert.equal(matchesScheduleEmployeeQuery("cmomo2r5k0033ptxch73uy80i", employee), true);
+  assert.equal(matchesScheduleEmployeeQuery("cmomo2r5k0033ptxch73uy8", employee), false);
+});
+
 test("shift references resolve by code or name, including a spoken 'shift 2' label", () => {
   const shifts = [
     { id: 7, code: "SHIFT-2", name: "Evening" },
@@ -156,6 +178,47 @@ test("shift references resolve by code or name, including a spoken 'shift 2' lab
     status: "resolved",
     shift: pmShift,
   });
+  assert.deepEqual(extractShiftReferenceFromMessage("Set Debbie Considine whole week shift to be PM", [pmShift]), {
+    status: "resolved",
+    shift: pmShift,
+  });
+  assert.deepEqual(extractShiftReferenceFromMessage("set shift to be PM", [
+    pmShift,
+    { id: 10, code: "4", name: "PM (Late)" },
+  ]), { status: "ambiguous" });
+});
+
+test("provider response handling retries only incomplete, unexecuted output and reserves final tokens", () => {
+  assert.equal(MAX_CHAT_INITIAL_TOOL_TOKENS, 2_400);
+  assert.equal(MAX_CHAT_COMPLETION_TOKENS, 5_000);
+  assert.equal(MAX_CHAT_FINAL_RESPONSE_TOKENS, 600);
+  assert.equal(shouldRetryIncompleteCompletion({ finishReason: "stop", content: "", validToolCallCount: 0, rejectedToolCallCount: 0 }), true);
+  assert.equal(shouldRetryIncompleteCompletion({ finishReason: "length", content: "partial", validToolCallCount: 0, rejectedToolCallCount: 0 }), true);
+  assert.equal(shouldRetryIncompleteCompletion({ finishReason: "length", content: "", validToolCallCount: 1, rejectedToolCallCount: 0 }), true, "length responses stay incomplete even if one tool call parses");
+  assert.deepEqual(getCompletionBudget(3_000, 2_500, 400), { remainingTokens: 500, toolTokens: 100, finalTokens: 400 });
+  assert.deepEqual(getCompletionBudget(3_000, 3_000, 400), { remainingTokens: 0, toolTokens: 0, finalTokens: 0 });
+
+  const malformed = validateProviderToolCalls({
+    value: [
+      { id: "bad", function: { name: "propose_schedule_operation", arguments: "{broken" } },
+      { id: "unknown", function: { name: "write_to_live_schedule", arguments: "{}" } },
+    ],
+    allowedToolNames: ["propose_schedule_operation"],
+    maxCalls: 3,
+  });
+  assert.equal(malformed.rawCallCount, 2);
+  assert.equal(malformed.rejectedCount, 2);
+  assert.deepEqual(malformed.calls, []);
+  assert.equal(validateProviderToolCalls({
+    value: { id: "invalid-envelope" },
+    allowedToolNames: ["propose_schedule_operation"],
+    maxCalls: 3,
+  }).rejectedCount, 1);
+});
+
+test("only an explicit unassigned request can restrict shift edits to unassigned cells", () => {
+  assert.equal(explicitlyRequestsUnassignedScheduleCells("set cashier PM, cooks AM and PM, rest MID"), false);
+  assert.equal(explicitlyRequestsUnassignedScheduleCells("set only unassigned cashier cells to PM"), true);
 });
 
 test("bulk shift edits without a date ask for the day scope before changing draft cells", () => {
@@ -184,14 +247,16 @@ test("chat prompt and tool allowlist propose structured changes without exposing
   assert.match(prompt, /Never ask the manager for a database shift ID/i);
   assert.match(prompt, /as shiftRef/i);
   assert.match(prompt, /Approval and publication are not available/i);
-  assert.match(prompt, /Combine group, shift, date, and preservation details into one/i);
+  assert.match(prompt, /Include every distinct requested group and assignment as an ordered action/i);
+  assert.match(prompt, /Never replace named groups with only unassigned employees/i);
+  assert.match(prompt, /complete revised plan/i);
   assert.match(prompt, /preserveExistingDayOff=true/i);
   assert.ok(AI_SCHEDULING_CHAT_TOOLS.includes("propose_schedule_operation"));
   assert.equal(AI_SCHEDULING_CHAT_TOOLS.includes("revise_schedule_draft" as never), false);
   assert.equal(AI_SCHEDULING_CHAT_TOOLS.includes("assign_shift_to_draft_scope" as never), false);
   assert.equal(AI_SCHEDULING_CHAT_TOOLS.some((name) => /approve|publish|payroll|violation/i.test(name)), false);
-  assert.equal(MAX_CHAT_COMPLETION_TOKENS, 3_000);
-  assert.equal(MAX_CHAT_FINAL_RESPONSE_TOKENS, 400);
+  assert.equal(MAX_CHAT_COMPLETION_TOKENS, 5_000);
+  assert.equal(MAX_CHAT_FINAL_RESPONSE_TOKENS, 600);
   assert.equal(MAX_CHAT_HISTORY_MESSAGES, 40);
   assert.equal(MAX_CHAT_TOOL_ROUNDS, 5);
   assert.equal(MAX_CHAT_TOOL_CALLS_PER_TURN, 5);
@@ -273,22 +338,222 @@ DISTRIBUTE_DAY_OFF
   assert.equal(sanitizeSchedulingAssistantMessage("Your preview is ready."), "Your preview is ready.");
 });
 
-test("all group shifts imply planner week and keep-day-off wording enables day-off preservation", () => {
-  assert.equal(shouldUsePlannerWeekForShiftAssignment("set all cashier shifts to PM and don't change the current day off"), true);
-  assert.equal(shouldUsePlannerWeekForShiftAssignment("set all cashier shifts to PM on Friday"), false);
-  assert.equal(shouldUsePlannerWeekForShiftAssignment("set cashier shifts to PM for the whole week"), true);
-  assert.equal(shouldPreserveExistingDayOff("set all cashier shifts to PM and don't change the current day off"), true);
-  assert.equal(shouldPreserveExistingDayOff("set all cashier shifts to PM and dont change the current day off"), true);
-  assert.equal(shouldPreserveExistingDayOff("set all cashier shifts to PM Friday"), false);
-  assert.deepEqual(inferSchedulingAssignmentTarget("set all cashier shifts to PM"), { targetType: "POSITION", targetQuery: "Cashier" });
-  assert.equal(inferSchedulingAssignmentTarget("set all employees to PM except cashiers"), null);
-  const departmentIntent = inferExplicitGroupShiftAssignment("set cashier department shift to PM whole week");
-  assert.equal(departmentIntent?.targetType, "DEPARTMENT");
-  assert.equal(departmentIntent?.usePlannerWeek, true);
-  const unassignedIntent = inferExplicitGroupShiftAssignment("set unassigned shift of cashier to be PM");
-  assert.equal(unassignedIntent?.targetType, "POSITION");
-  assert.equal(unassignedIntent?.onlyUnassigned, true);
-  assert.equal(unassignedIntent?.usePlannerWeek, true);
+test("ordered compound intent represents Debbie week PM with Saturday OFF", () => {
+  const intent = scheduleOperationIntentSchema.parse({
+    operation: "ASSIGN_SHIFT",
+    targetType: "EMPLOYEE",
+    targetQuery: "Debbie Considine",
+    actions: [
+      { assignmentKind: "WORK", shiftRef: "PM", workDates: [], usePlannerWeek: true, preserveExistingDayOff: false, onlyUnassigned: false },
+      { assignmentKind: "DAY_OFF", shiftRef: null, workDates: ["2026-10-24"], usePlannerWeek: false, preserveExistingDayOff: false, onlyUnassigned: false },
+    ],
+  });
+  assert.equal(intent.actions.length, 2);
+  assert.equal(intent.actions[0].usePlannerWeek, true);
+  assert.deepEqual(intent.actions[1].workDates, ["2026-10-24"]);
+
+  const dates = ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23", "2026-10-24", "2026-10-25"];
+  const assignments = dates.map((workDate) => ({
+    employeeId: "debbie-id",
+    workDate,
+    shiftId: 1,
+    assignmentKind: "WORK" as const,
+    reason: null,
+    isProtected: false,
+    hasBaselineOverride: false,
+  }));
+  const combined = applyScheduleAssignmentSequence({
+    assignments,
+    employeeIds: ["debbie-id"],
+    actions: [
+      { dates, shiftId: 2, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+      { dates: ["2026-10-24"], shiftId: 9, assignmentKind: "DAY_OFF", preserveExistingDayOff: false, onlyUnassigned: false },
+    ],
+  });
+  assert.deepEqual(combined.assignments.map((assignment) => assignment.assignmentKind), ["WORK", "WORK", "WORK", "WORK", "WORK", "DAY_OFF", "WORK"]);
+  assert.deepEqual(combined.assignments.map((assignment) => assignment.shiftId), [2, 2, 2, 2, 2, 9, 2]);
+  assert.equal(canApplyScheduleOperation({
+    status: "PROPOSAL",
+    canApply: true,
+    hasAssignments: combined.assignments.length === dates.length,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }), true, "one approval applies the complete combined plan");
+});
+
+test("compound group plan can assign separate scopes and split cooks evenly", () => {
+  const dates = ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23", "2026-10-24", "2026-10-25"];
+  const cashiers = ["cashier-1", "cashier-2", "cashier-3", "cashier-4"];
+  const cooks = ["cook-1", "cook-2", "cook-3", "cook-4", "cook-5"];
+  const others = ["other-1", "other-2", "other-3"];
+  const all = [...cashiers, ...cooks, ...others];
+  const [cookAm, cookPm] = splitEmployeesEvenly(cooks, 2, "2026-10-19:Cook");
+  assert.equal(cookAm.length, 3);
+  assert.equal(cookPm.length, 2);
+  assert.deepEqual(splitEmployeesEvenly(cooks, 2, "2026-10-19:Cook"), [cookAm, cookPm]);
+
+  const assignments = all.flatMap((employeeId) => dates.map((workDate) => ({
+    employeeId,
+    workDate,
+    shiftId: 1,
+    assignmentKind: "WORK" as const,
+    reason: null,
+    isProtected: false,
+    hasBaselineOverride: false,
+  })));
+  const result = applyScheduleAssignmentSequence({
+    assignments,
+    employeeIds: all,
+    actions: [
+      { employeeIds: cashiers, dates, shiftId: 2, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+      { employeeIds: cookAm, dates, shiftId: 3, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+      { employeeIds: cookPm, dates, shiftId: 4, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+      { employeeIds: others, dates, shiftId: 5, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+    ],
+  });
+  for (const employeeId of cashiers) assert.ok(result.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 2));
+  for (const employeeId of cookAm) assert.ok(result.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 3));
+  for (const employeeId of cookPm) assert.ok(result.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 4));
+  for (const employeeId of others) assert.ok(result.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 5));
+  assert.equal(result.assignments.length, all.length * dates.length);
+
+  const intent = scheduleOperationIntentSchema.parse({
+    operation: "ASSIGN_SHIFT",
+    actions: [
+      { targetType: "POSITION", targetQuery: "Cashier", shiftRef: "PM", usePlannerWeek: true },
+      { targetType: "POSITION", targetQuery: "Cook", allocationGroup: "cook-split", shiftRef: "AM", usePlannerWeek: true },
+      { targetType: "POSITION", targetQuery: "Cook", allocationGroup: "cook-split", shiftRef: "PM", usePlannerWeek: true },
+      { targetType: "ALL", excludeTargetQueries: ["Cashier", "Cook"], shiftRef: "MID", usePlannerWeek: true },
+    ],
+  });
+  assert.equal(intent.actions.length, 4);
+  assert.equal(intent.targetType, "ALL");
+  const prompt = buildSchedulingChatSystemPrompt("2026-10-19", { weekStart: "2026-10-19" });
+  assert.match(prompt, /same allocationGroup on both/i);
+  assert.match(prompt, /Never replace named groups with only unassigned employees/i);
+});
+
+test("natural-language group scopes map Cashier, Cook split, and remaining employees to the right shifts", () => {
+  const cashiers = ["cashier-1", "cashier-2", "cashier-3"];
+  const cooks = ["cook-1", "cook-2", "cook-3", "cook-4", "cook-5"];
+  const others = ["other-1", "other-2"];
+  const scopes = inferScheduleActionScopesFromText({
+    message: "set cashier pm, set cook half on am and half on pm, and the rest to mid shift",
+    groups: [
+      { id: "cashier-position", type: "POSITION", name: "Cashier", employeeIds: cashiers },
+      { id: "cook-position", type: "POSITION", name: "Cook", employeeIds: cooks },
+    ],
+    shifts: [
+      { id: 2, code: "PM", name: "PM · Afternoon", isDayOff: false },
+      { id: 3, code: "AM", name: "AM · Morning", isDayOff: false },
+      { id: 5, code: "MID", name: "Mid Shift", isDayOff: false },
+    ],
+    actionShiftIds: [2, 3, 2, 5],
+    allEmployeeIds: [...cashiers, ...cooks, ...others],
+  });
+
+  assert.deepEqual(scopes.map((scope) => scope?.targetLabel), [
+    "Cashier",
+    "Cook",
+    "Cook",
+    "All employees except Cashier, Cook",
+  ]);
+  assert.deepEqual(scopes.map((scope) => scope?.employeeIds), [
+    cashiers,
+    cooks,
+    cooks,
+    others,
+  ]);
+  assert.deepEqual(scopes.map((scope) => scope?.splitRequested), [false, true, true, false]);
+  const [amCookPartition, pmCookPartition] = splitEmployeesEvenly(cooks, 2, "2026-10-19:POSITION:cook-position");
+  assert.equal(amCookPartition.length + pmCookPartition.length, cooks.length);
+  assert.equal(new Set([...amCookPartition, ...pmCookPartition]).size, cooks.length);
+  const week = ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23", "2026-10-24", "2026-10-25"];
+  const employeeIds = [...cashiers, ...cooks, ...others];
+  const applied = applyScheduleAssignmentSequence({
+    assignments: employeeIds.flatMap((employeeId) => week.map((workDate) => ({
+      employeeId,
+      workDate,
+      shiftId: 1,
+      assignmentKind: "WORK" as const,
+      isProtected: false,
+      hasBaselineOverride: false,
+      reason: null,
+    }))),
+    employeeIds,
+    actions: [
+      { employeeIds: scopes[0]!.employeeIds, dates: week, shiftId: 2, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+      { employeeIds: amCookPartition, dates: week, shiftId: 3, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+      { employeeIds: pmCookPartition, dates: week, shiftId: 2, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+      { employeeIds: scopes[3]!.employeeIds, dates: week, shiftId: 5, assignmentKind: "WORK", preserveExistingDayOff: false, onlyUnassigned: false },
+    ],
+  });
+  for (const employeeId of cashiers) assert.ok(applied.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 2));
+  for (const employeeId of amCookPartition) assert.ok(applied.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 3));
+  for (const employeeId of pmCookPartition) assert.ok(applied.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 2));
+  for (const employeeId of others) assert.ok(applied.assignments.filter((row) => row.employeeId === employeeId).every((row) => row.shiftId === 5));
+});
+
+test("proposal preview selects representative changes across every action group", () => {
+  const changes = [
+    ...Array.from({ length: 21 }, (_, index) => ({ after: "PM · Afternoon", planLabel: "Cashier → PM · Afternoon", employeeCode: `C${index}` })),
+    ...Array.from({ length: 14 }, (_, index) => ({ after: "AM · Morning", planLabel: "Cook → AM · Morning", employeeCode: `A${index}` })),
+    ...Array.from({ length: 14 }, (_, index) => ({ after: "PM · Afternoon", planLabel: "Cook → PM · Afternoon", employeeCode: `P${index}` })),
+    ...Array.from({ length: 63 }, (_, index) => ({ after: "MID · Mid Shift", planLabel: "All except Cashier, Cook → MID · Mid Shift", employeeCode: `R${index}` })),
+  ];
+  const preview = selectRepresentativeScheduleChanges(changes, 100);
+  assert.equal(preview.length, 100);
+  assert.deepEqual(preview.slice(0, 4).map((change) => change.planLabel), [
+    "Cashier → PM · Afternoon",
+    "Cook → AM · Morning",
+    "Cook → PM · Afternoon",
+    "All except Cashier, Cook → MID · Mid Shift",
+  ]);
+  assert.equal(new Set(preview.map((change) => change.planLabel)).size, 4);
+});
+
+test("pending corrections inherit resolved target while replacing the complete operation plan", () => {
+  const previous = scheduleOperationIntentSchema.parse({
+    operation: "ASSIGN_SHIFT",
+    targetType: "EMPLOYEE",
+    targetQuery: "Debbie Considine",
+    actions: [{ assignmentKind: "WORK", shiftRef: "PM", usePlannerWeek: true }],
+  });
+  const correction = scheduleOperationIntentSchema.parse({
+    operation: "ASSIGN_SHIFT",
+    actions: [{ assignmentKind: "DAY_OFF", workDates: ["2026-10-23"] }],
+  });
+  const merged = mergePendingScheduleIntent(previous, correction);
+  assert.equal(merged.targetType, "EMPLOYEE");
+  assert.equal(merged.targetQuery, "Debbie Considine");
+  assert.deepEqual(merged.actions[0].workDates, ["2026-10-23"]);
+  assert.equal(merged.actions.length, 1);
+});
+
+test("day-off distribution assigns exactly one OFF for every eligible employee", () => {
+  const dates = ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23", "2026-10-24", "2026-10-25"];
+  const employeeIds = ["cashier-1", "cashier-2", "cashier-3"];
+  const assignments = employeeIds.flatMap((employeeId) => dates.map((workDate) => ({
+    employeeId,
+    workDate,
+    shiftId: 1,
+    assignmentKind: "WORK" as const,
+    isProtected: false,
+    hasBaselineOverride: false,
+  })));
+  const result = distributeDayOffAssignments({
+    assignments,
+    employeeIds,
+    dates,
+    dayOffShiftId: 9,
+    dayOffShiftIds: [9],
+    weekStart: dates[0],
+    seed: "exactly-one-off-test",
+    dayOffCount: 1,
+  });
+  assert.deepEqual(result.blocked, []);
+  for (const employeeId of employeeIds) {
+    assert.equal(result.assignments.filter((assignment) => assignment.employeeId === employeeId && assignment.assignmentKind === "DAY_OFF").length, 1);
+  }
 });
 
 test("working-shift proposal preserves existing days off when manager requests it", () => {
@@ -339,6 +604,9 @@ test("unassigned-only shift proposal leaves working and day-off cells unchanged"
 });
 
 test("natural role matching accepts plural job titles and department phrases", () => {
+  assert.equal(containsNaturalGroupName("set all cashiers to PM", "Cashier"), true);
+  assert.equal(containsNaturalGroupName("set all cooks to AM", "Cook"), true);
+  assert.equal(containsNaturalGroupName("set cooking shift to AM", "Cook"), false);
   assert.equal(matchesNaturalGroupName("cashiers", "Cashier"), true);
   assert.equal(matchesNaturalGroupName("the front desk team", "Front Desk"), true);
   assert.equal(matchesNaturalGroupName("cashiers", "Managers"), false);
@@ -448,6 +716,11 @@ test("operation intent allows server-side shift and swap clarification", () => {
     targetEmployeeQueries: ["Brandon Lee", "Maya Cruz"],
     shiftRef: "2",
   }).success, true, "one request can target several individually resolved employees");
+  const normalized = scheduleOperationIntentSchema.parse({ operation: "ASSIGN_SHIFT" });
+  assert.equal(normalized.targetType, "ALL");
+  assert.deepEqual(normalized.actions, []);
+  assert.deepEqual(normalized.workDates, []);
+  assert.equal(normalized.usePlannerWeek, false);
 });
 
 test("pending interactions expire and reject changed draft versions or fingerprints", () => {
