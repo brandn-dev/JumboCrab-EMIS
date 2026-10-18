@@ -12,6 +12,14 @@ import {
   saveWeekPlannerAssignments,
   upsertScheduleOverride,
 } from "@/actions/schedule/schedule-action";
+import {
+  createScheduleDraft,
+  discardScheduleDraft,
+  getScheduleDraftVersion,
+  listScheduleDraftsForWeek,
+  saveScheduleDraftVersion,
+} from "@/actions/schedule/schedule-draft-action";
+import { getSchedulePolicyFeatureAvailability } from "@/actions/schedule/schedule-policy-action";
 import { createShift, deleteShift, updateShift } from "@/actions/schedule/shifts-action";
 import { DailyScheduleCard } from "./daily-schedule-card";
 import { OverridesSection } from "./overrides-section";
@@ -43,6 +51,11 @@ import {
   weekPlannerRowToShiftMap,
   WeekShiftMap,
 } from "@/types/schedule-types";
+import type {
+  ScheduleDraftAssignment,
+  ScheduleDraftDetails,
+  ScheduleDraftGroup,
+} from "@/types/schedule-draft-types";
 
 type ScheduleBoardProps = {
   mode?: "full" | "overrides" | "patterns";
@@ -50,6 +63,39 @@ type ScheduleBoardProps = {
 
 const areWeekShiftMapsEqual = (left: WeekShiftMap, right: WeekShiftMap) =>
   weekPlannerDayKeys.every((dayKey) => (left[dayKey] ?? null) === (right[dayKey] ?? null));
+
+const getDraftDayKey = (workDate: string): WeekPlannerDayKey => {
+  const date = new Date(`${workDate}T12:00:00.000Z`);
+  const weekday = date.getUTCDay();
+  return weekPlannerDayKeys[weekday === 0 ? 6 : weekday - 1];
+};
+
+const draftAssignmentsToShiftMaps = (assignments: ScheduleDraftAssignment[]) =>
+  assignments.reduce<Record<string, WeekShiftMap>>((maps, assignment) => {
+    maps[assignment.employeeId] ??= {
+      mon: null,
+      tue: null,
+      wed: null,
+      thu: null,
+      fri: null,
+      sat: null,
+      sun: null,
+    };
+    maps[assignment.employeeId][getDraftDayKey(assignment.workDate)] = assignment.shiftId;
+    return maps;
+  }, {});
+
+const sameDraftAssignments = (
+  draft: ScheduleDraftDetails,
+  maps: Record<string, WeekShiftMap> | undefined,
+  shiftsById: Map<number, ShiftLite>,
+) => draft.assignments.every((assignment) => {
+  const shiftId = maps?.[assignment.employeeId]?.[getDraftDayKey(assignment.workDate)] ?? null;
+  if (shiftId !== assignment.shiftId) return false;
+  if (assignment.isProtected) return true;
+  const kind = shiftId == null ? "UNASSIGNED" : shiftsById.get(shiftId)?.isDayOff ? "DAY_OFF" : "WORK";
+  return kind === assignment.assignmentKind;
+});
 
 export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
   const toast = useToast();
@@ -73,6 +119,16 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
   const [plannerDraftShiftMapByWeek, setPlannerDraftShiftMapByWeek] = useState<
     Record<string, Record<string, WeekShiftMap>>
   >({});
+  const [plannerMode, setPlannerMode] = useState<"MANUAL" | "AI_DRAFT">("MANUAL");
+  const [plannerDraftGroups, setPlannerDraftGroups] = useState<ScheduleDraftGroup[]>([]);
+  const [plannerActiveDraft, setPlannerActiveDraft] = useState<ScheduleDraftDetails | null>(null);
+  const [plannerAIDraftShiftMaps, setPlannerAIDraftShiftMaps] = useState<
+    Record<string, Record<string, WeekShiftMap>>
+  >({});
+  const [plannerDraftLoading, setPlannerDraftLoading] = useState(false);
+  const [plannerAiSchedulingEnabled, setPlannerAiSchedulingEnabled] = useState(false);
+  const [plannerAiSchedulingChatEnabled, setPlannerAiSchedulingChatEnabled] = useState(false);
+  const [plannerDraftError, setPlannerDraftError] = useState<string | null>(null);
   const [plannerDepartments, setPlannerDepartments] = useState<PlannerDepartmentOption[]>([]);
   const [plannerScheduleWeekOptions, setPlannerScheduleWeekOptions] = useState<
     Array<{ weekStart: string; isAssigned: boolean; unassignedCount: number }>
@@ -196,9 +252,44 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
       setShifts(snapshot.shifts);
       setPlannerScheduleWeekOptions(snapshot.scheduleWeekOptions);
       setPlannerReferenceWeekOptions(snapshot.referenceWeekOptions);
+
+      const featureResult = await getSchedulePolicyFeatureAvailability();
+      const aiEnabled = featureResult.success && featureResult.enabled;
+      setPlannerAiSchedulingEnabled(aiEnabled);
+      setPlannerAiSchedulingChatEnabled(aiEnabled && featureResult.success && featureResult.chatEnabled);
+      if (!aiEnabled) {
+        setPlannerAiSchedulingChatEnabled(false);
+        setPlannerDraftGroups([]);
+        setPlannerActiveDraft(null);
+        setPlannerMode("MANUAL");
+      } else {
+        setPlannerDraftLoading(true);
+        setPlannerDraftError(null);
+        const draftResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+        if (!draftResult.success) {
+          setPlannerDraftError(draftResult.error || "Draft storage is unavailable.");
+          setPlannerDraftGroups([]);
+          setPlannerActiveDraft(null);
+        } else {
+          setPlannerDraftGroups(draftResult.data);
+          const activeStillExists = plannerActiveDraft?.weekStart === plannerWeekStart &&
+            draftResult.data.some((group) => group.versions.some((version) => version.id === plannerActiveDraft.id));
+          if (!activeStillExists) {
+            const latest = draftResult.data[0]?.latest;
+            if (latest) {
+              const latestResult = await getScheduleDraftVersion({ draftId: latest.id });
+              if (latestResult.success) setActivePlannerDraft(latestResult.data);
+              else setPlannerDraftError(latestResult.error || "Failed to restore saved draft");
+            } else {
+              setPlannerActiveDraft(null);
+            }
+          }
+        }
+      }
     } catch (err) {
       setPlannerError(err instanceof Error ? err.message : "Failed to load week planner");
     } finally {
+      setPlannerDraftLoading(false);
       setPlannerLoading(false);
     }
   };
@@ -228,13 +319,32 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
     () => plannerDraftShiftMapByWeek[plannerWeekStart] ?? {},
     [plannerDraftShiftMapByWeek, plannerWeekStart],
   );
-  const plannerDirty = Object.keys(currentWeekDraftShiftMap).length > 0;
+  const currentWeekAIDraft =
+    plannerActiveDraft?.weekStart === plannerWeekStart ? plannerActiveDraft : null;
+  const currentWeekAIDraftShiftMap = useMemo(
+    () => currentWeekAIDraft
+      ? plannerAIDraftShiftMaps[currentWeekAIDraft.id] ?? {}
+      : {},
+    [currentWeekAIDraft, plannerAIDraftShiftMaps],
+  );
+  const aiDraftDirty = currentWeekAIDraft
+    ? !sameDraftAssignments(
+        currentWeekAIDraft,
+        currentWeekAIDraftShiftMap,
+        shiftsById,
+      )
+    : false;
+  const plannerDirty = plannerMode === "AI_DRAFT"
+    ? aiDraftDirty
+    : Object.keys(currentWeekDraftShiftMap).length > 0;
 
   const plannerAllRows = useMemo(
     () =>
       Object.values(currentWeekRowCache)
         .map((baseRow) => {
-          const draftShiftMap = currentWeekDraftShiftMap[baseRow.employee.employeeId];
+          const draftShiftMap = plannerMode === "AI_DRAFT"
+            ? currentWeekAIDraftShiftMap[baseRow.employee.employeeId]
+            : currentWeekDraftShiftMap[baseRow.employee.employeeId];
           const nextRow = draftShiftMap ? applyWeekPlannerShiftMap(baseRow, draftShiftMap) : baseRow;
           return hydrateWeekPlannerRowShifts(nextRow, shiftsById);
         })
@@ -242,7 +352,7 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
           const lastCmp = left.employee.lastName.localeCompare(right.employee.lastName);
           return lastCmp !== 0 ? lastCmp : left.employee.firstName.localeCompare(right.employee.firstName);
         }),
-    [currentWeekDraftShiftMap, currentWeekRowCache, shiftsById],
+    [currentWeekAIDraftShiftMap, currentWeekDraftShiftMap, currentWeekRowCache, plannerMode, shiftsById],
   );
 
   const plannerDepartmentRows = useMemo(() => {
@@ -566,9 +676,174 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
     }));
   };
 
+  const setActivePlannerDraft = (draft: ScheduleDraftDetails) => {
+    setPlannerActiveDraft(draft);
+    setPlannerDepartmentId(draft.scope.departmentId ?? "");
+    setPlannerSelectedEmployeeIds(
+      draft.scope.selectionMode === "SELECTED" ? draft.scope.employeeIds : [],
+    );
+    setPlannerAIDraftShiftMaps((previous) => ({
+      ...previous,
+      [draft.id]: draftAssignmentsToShiftMaps(draft.assignments),
+    }));
+    setPlannerMode("AI_DRAFT");
+    setPlannerDraftError(null);
+  };
+
+  const handlePlannerDraftSelect = async (draftId: string) => {
+    if (!draftId) {
+      setPlannerActiveDraft(null);
+      return;
+    }
+    try {
+      setPlannerDraftLoading(true);
+      setPlannerDraftError(null);
+      const result = await getScheduleDraftVersion({ draftId });
+      if (!result.success) throw new Error(result.error || "Failed to load draft version");
+      setActivePlannerDraft(result.data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to load draft version";
+      setPlannerDraftError(message);
+      toast.error("Failed to load draft.", { description: message });
+    } finally {
+      setPlannerDraftLoading(false);
+    }
+  };
+
+  const handlePlannerDraftCreate = async (sourceMode: "CURRENT_SCHEDULE" | "REFERENCE_WEEK" | "EMPTY") => {
+    try {
+      setPlannerSaving(true);
+      setPlannerDraftError(null);
+      const result = await createScheduleDraft({
+        requestKey: globalThis.crypto.randomUUID(),
+        weekStart: plannerWeekStart,
+        referenceWeekStart: sourceMode === "REFERENCE_WEEK" ? plannerCompareWeekStart : null,
+        departmentId: plannerDepartmentId || null,
+        selectedEmployeeIds: plannerSelectedEmployeeIds,
+        sourceMode,
+      });
+      if (!result.success) throw new Error(result.error || "Failed to create draft");
+      setActivePlannerDraft(result.data);
+      const listResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+      if (listResult.success) setPlannerDraftGroups(listResult.data);
+      toast.success("Draft created.", {
+        description: `Draft v${result.data.version} is saved separately from live schedules.`,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to create draft";
+      setPlannerDraftError(message);
+      toast.error("Failed to create draft.", { description: message });
+    } finally {
+      setPlannerSaving(false);
+    }
+  };
+
+  const handlePlannerDraftSave = async () => {
+    if (!currentWeekAIDraft) return;
+    const shiftMaps = currentWeekAIDraftShiftMap;
+    try {
+      setPlannerSaving(true);
+      setPlannerDraftError(null);
+      const assignments = currentWeekAIDraft.assignments.map((assignment) => {
+        const dayKey = getDraftDayKey(assignment.workDate);
+        const liveRow = currentWeekRowCache[assignment.employeeId];
+        const day = liveRow?.days[dayKey];
+        const shiftId = day?.leave
+          ? assignment.baselineShiftId
+          : shiftMaps[assignment.employeeId]?.[dayKey] ?? assignment.shiftId;
+        const assignmentKind = day?.leave
+          ? "PROTECTED_LEAVE"
+          : shiftId == null
+            ? "UNASSIGNED"
+            : shiftsById.get(shiftId)?.isDayOff
+              ? "DAY_OFF"
+              : "WORK";
+        return { ...assignment, shiftId, assignmentKind };
+      });
+      const result = await saveScheduleDraftVersion({
+        requestKey: globalThis.crypto.randomUUID(),
+        draftId: currentWeekAIDraft.id,
+        assignments,
+      });
+      if (!result.success) throw new Error(result.error || "Failed to save draft");
+      setActivePlannerDraft(result.data);
+      const listResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+      if (listResult.success) setPlannerDraftGroups(listResult.data);
+      toast.success("Draft version saved.", {
+        description: `Saved draft v${result.data.version}. Live schedules were not changed.`,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to save draft";
+      setPlannerDraftError(message);
+      toast.error("Failed to save draft.", { description: message });
+    } finally {
+      setPlannerSaving(false);
+    }
+  };
+
+  const handlePlannerDraftGenerated = async (draft: ScheduleDraftDetails) => {
+    setActivePlannerDraft(draft);
+    const listResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+    if (listResult.success) setPlannerDraftGroups(listResult.data);
+  };
+
+  const handlePlannerDraftDiscard = async () => {
+    if (!currentWeekAIDraft) return;
+    try {
+      setPlannerSaving(true);
+      setPlannerDraftError(null);
+      const result = await discardScheduleDraft({ draftId: currentWeekAIDraft.id });
+      if (!result.success) throw new Error(result.error || "Failed to discard draft");
+      setPlannerActiveDraft(null);
+      setPlannerAIDraftShiftMaps((previous) => {
+        const next = { ...previous };
+        delete next[currentWeekAIDraft.id];
+        return next;
+      });
+      const listResult = await listScheduleDraftsForWeek({ weekStart: plannerWeekStart });
+      if (listResult.success) setPlannerDraftGroups(listResult.data);
+      toast.success("Draft discarded.");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to discard draft";
+      setPlannerDraftError(message);
+      toast.error("Failed to discard draft.", { description: message });
+    } finally {
+      setPlannerSaving(false);
+    }
+  };
+
+  const handlePlannerModeChange = (mode: "MANUAL" | "AI_DRAFT") => {
+    setPlannerMode(mode);
+    if (mode === "AI_DRAFT" && !currentWeekAIDraft) {
+      const latestDraft = plannerDraftGroups[0]?.latest;
+      if (latestDraft) void handlePlannerDraftSelect(latestDraft.id);
+    }
+  };
+
   const applyPlannerShiftMaps = (
     employeeShiftMaps: Array<{ employeeId: string; shiftMap: WeekShiftMap }>,
   ) => {
+    if (plannerMode === "AI_DRAFT") {
+      if (
+        !currentWeekAIDraft ||
+        !currentWeekAIDraft.isLatestVersion ||
+        currentWeekAIDraft.status === "PUBLISHED" ||
+        currentWeekAIDraft.status === "DISCARDED"
+      ) {
+        return;
+      }
+      setPlannerAIDraftShiftMaps((previous) => {
+        const next = { ...previous };
+        const draftMap = { ...(previous[currentWeekAIDraft.id] ?? draftAssignmentsToShiftMaps(currentWeekAIDraft.assignments)) };
+        for (const { employeeId, shiftMap } of employeeShiftMaps) {
+          draftMap[employeeId] = shiftMap;
+        }
+        next[currentWeekAIDraft.id] = draftMap;
+        return next;
+      });
+      return;
+    }
+
     setPlannerDraftsForCurrentWeek((drafts) => {
       const nextDrafts = { ...drafts };
 
@@ -588,11 +863,17 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
   };
 
   const reloadPlannerFromServer = async () => {
-    setPlannerDraftShiftMapByWeek((prev) => {
-      const next = { ...prev };
-      delete next[plannerWeekStart];
-      return next;
-    });
+    if (plannerMode === "AI_DRAFT" && currentWeekAIDraft) {
+      const result = await getScheduleDraftVersion({ draftId: currentWeekAIDraft.id });
+      if (result.success) setActivePlannerDraft(result.data);
+      else setPlannerDraftError(result.error || "Failed to reload draft");
+    } else {
+      setPlannerDraftShiftMapByWeek((prev) => {
+        const next = { ...prev };
+        delete next[plannerWeekStart];
+        return next;
+      });
+    }
     await loadPlanner();
   };
 
@@ -1041,6 +1322,11 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
   };
 
   const handlePlannerSave = async () => {
+    if (plannerMode === "AI_DRAFT") {
+      await handlePlannerDraftSave();
+      return;
+    }
+
     const dirtyEmployeeIds = Object.keys(currentWeekDraftShiftMap);
     if (dirtyEmployeeIds.length === 0) {
       setPlannerError("No planner changes to save");
@@ -1129,8 +1415,27 @@ export function ScheduleBoard({ mode = "full" }: ScheduleBoardProps) {
           saving={plannerSaving}
           error={plannerError}
           dirty={plannerDirty}
-          canSave={plannerDirty && plannerUnassignedEditableCount === 0}
+          canSave={plannerMode === "AI_DRAFT"
+            ? Boolean(
+                currentWeekAIDraft?.isLatestVersion &&
+                currentWeekAIDraft.status !== "PUBLISHED" &&
+                currentWeekAIDraft.status !== "DISCARDED" &&
+                aiDraftDirty,
+              )
+            : plannerDirty && plannerUnassignedEditableCount === 0}
           unassignedCount={plannerUnassignedEditableCount}
+          plannerMode={plannerMode}
+          aiSchedulingEnabled={plannerAiSchedulingEnabled}
+          aiSchedulingChatEnabled={plannerAiSchedulingChatEnabled}
+          draftGroups={plannerDraftGroups}
+          activeDraft={currentWeekAIDraft}
+          draftLoading={plannerDraftLoading}
+          draftError={plannerDraftError}
+          onPlannerModeChange={handlePlannerModeChange}
+          onDraftVersionChange={handlePlannerDraftSelect}
+          onCreateDraft={handlePlannerDraftCreate}
+          onDraftGenerated={handlePlannerDraftGenerated}
+          onDiscardDraft={handlePlannerDraftDiscard}
           onWeekStartChange={setPlannerWeekStart}
           onCompareWeekStartChange={setPlannerCompareWeekStart}
           onDepartmentChange={setPlannerDepartmentId}

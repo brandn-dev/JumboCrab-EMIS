@@ -1,9 +1,10 @@
 "use server";
 
-import { ATTENDANCE_STATUS, Roles } from "@prisma/client";
+import { ATTENDANCE_STATUS } from "@prisma/client";
 import { addDays, startOfWeek } from "date-fns";
-import { getSession } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { requireScheduleActor } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import { getExpectedShiftForDate } from "@/lib/attendance";
 import { serializeShift } from "@/lib/serializers/schedule";
 import {
@@ -39,17 +40,7 @@ export async function getSupervisorTeamWeekSchedule(input?: {
   anchorDate?: string | null;
 }) {
   try {
-    const session = await getSession();
-    if (
-      !session.isLoggedIn ||
-      !session.userId ||
-      session.role !== Roles.Supervisor
-    ) {
-      return {
-        success: false,
-        error: "You are not allowed to view team schedules.",
-      };
-    }
+    const actor = await requireScheduleActor(["supervisor"]);
 
     const anchorDateRaw =
       typeof input?.anchorDate === "string" ? input.anchorDate : "";
@@ -64,7 +55,7 @@ export async function getSupervisorTeamWeekSchedule(input?: {
 
     const employees = await db.employee.findMany({
       where: {
-        supervisorUserId: session.userId,
+        supervisorUserId: actor.userId,
         isArchived: false,
       },
       orderBy: [{ employeeCode: "asc" }, { lastName: "asc" }],
@@ -167,6 +158,13 @@ export async function getSupervisorTeamWeekSchedule(input?: {
     };
   } catch (error) {
     console.error("Failed to fetch supervisor team schedule", error);
-    return { success: false, error: "Failed to load team schedule." };
+    const accessError = scheduleAccessError(error, "Failed to load team schedule.");
+    return {
+      success: false,
+      error:
+        accessError === "Unauthorized" || accessError === "Forbidden"
+          ? "You are not allowed to view team schedules."
+          : accessError,
+    };
   }
 }

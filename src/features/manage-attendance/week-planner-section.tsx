@@ -15,6 +15,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -38,7 +39,10 @@ import {
   weekPlannerDayKeys,
   weekPlannerDayLabel,
 } from "@/types/schedule-types";
-import { CalendarDays, CheckCircle2, Plus, RefreshCcw, Save, Users, X } from "lucide-react";
+import type { ScheduleDraftDetails, ScheduleDraftGroup } from "@/types/schedule-draft-types";
+import { SchedulePolicyPanel } from "./schedule-policy-panel";
+import { ScheduleAssistantPanel } from "./schedule-assistant-panel";
+import { CalendarDays, Plus, RefreshCcw, Save, Users, X } from "lucide-react";
 
 type WeekPlannerSectionProps = {
   weekStart: string;
@@ -58,6 +62,18 @@ type WeekPlannerSectionProps = {
   dirty: boolean;
   canSave: boolean;
   unassignedCount: number;
+  plannerMode: "MANUAL" | "AI_DRAFT";
+  aiSchedulingEnabled: boolean;
+  aiSchedulingChatEnabled: boolean;
+  draftGroups: ScheduleDraftGroup[];
+  activeDraft: ScheduleDraftDetails | null;
+  draftLoading: boolean;
+  draftError: string | null;
+  onPlannerModeChange: (mode: "MANUAL" | "AI_DRAFT") => void;
+  onDraftVersionChange: (draftId: string) => void;
+  onCreateDraft: (sourceMode: "CURRENT_SCHEDULE" | "REFERENCE_WEEK" | "EMPTY") => void;
+  onDraftGenerated: (draft: ScheduleDraftDetails) => void;
+  onDiscardDraft: () => void;
   onWeekStartChange: (value: string) => void;
   onCompareWeekStartChange: (value: string) => void;
   onDepartmentChange: (value: string) => void;
@@ -215,6 +231,18 @@ export function WeekPlannerSection({
   dirty,
   canSave,
   unassignedCount,
+  plannerMode,
+  aiSchedulingEnabled,
+  aiSchedulingChatEnabled,
+  draftGroups,
+  activeDraft,
+  draftLoading,
+  draftError,
+  onPlannerModeChange,
+  onDraftVersionChange,
+  onCreateDraft,
+  onDraftGenerated,
+  onDiscardDraft,
   onWeekStartChange,
   onCompareWeekStartChange,
   onDepartmentChange,
@@ -789,6 +817,17 @@ export function WeekPlannerSection({
     () => dayOffSelectionSummary.filter((entry) => entry.hasDoubleDayOff).length,
     [dayOffSelectionSummary],
   );
+  const draftVersions = useMemo(
+    () => draftGroups.flatMap((group) => group.versions),
+    [draftGroups],
+  );
+  const draftAssignmentsByKey = useMemo(
+    () => new Map(activeDraft?.assignments.map((assignment) => [
+      `${assignment.employeeId}:${assignment.workDate}`,
+      assignment,
+    ]) ?? []),
+    [activeDraft],
+  );
 
   return (
     <Card className="shadow-sm">
@@ -797,8 +836,33 @@ export function WeekPlannerSection({
           <div>
             <CardTitle className="text-lg">Weekly Schedule Planner</CardTitle>
             <p className="text-sm text-muted-foreground">
-              Build weekly schedules, compare with a reference week, then save dirty employees only.
+              {plannerMode === "AI_DRAFT"
+                ? "Create and revise a private schedule draft. Changes stay out of employee schedules."
+                : "Build weekly schedules, compare with a reference week, then save dirty employees only."}
             </p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant={plannerMode === "MANUAL" ? "default" : "outline"}
+                onClick={() => onPlannerModeChange("MANUAL")}
+              >
+                Manual
+              </Button>
+              {aiSchedulingEnabled ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={plannerMode === "AI_DRAFT" ? "default" : "outline"}
+                  onClick={() => onPlannerModeChange("AI_DRAFT")}
+                >
+                  AI Draft
+                </Button>
+              ) : null}
+            </div>
+            {!aiSchedulingEnabled ? (
+              <p className="mt-2 text-xs text-muted-foreground">AI Draft is disabled by server configuration. Manual scheduling remains available.</p>
+            ) : null}
           </div>
           <div className="flex flex-col items-start gap-2 md:items-end">
             {unassignedCount > 0 ? (
@@ -827,11 +891,101 @@ export function WeekPlannerSection({
                 disabled={loading || saving || !canSave}
               >
                 <Save className="h-4 w-4" />
-                {saving ? "Saving..." : "Save week"}
+                {saving ? "Saving..." : plannerMode === "AI_DRAFT" ? "Save Draft" : "Save week"}
               </Button>
             </div>
           </div>
         </div>
+
+        {plannerMode === "AI_DRAFT" ? (
+          <div className="space-y-3 rounded-lg border border-primary/25 bg-primary/[0.03] p-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-semibold">Draft workspace</div>
+                  {activeDraft ? <Badge variant="secondary">Draft v{activeDraft.version}</Badge> : null}
+                  {activeDraft ? <Badge variant="outline">{activeDraft.status}</Badge> : null}
+                  {activeDraft?.isSourceStale ? <Badge variant="warning">Source changed</Badge> : null}
+                  {activeDraft && !activeDraft.isLatestVersion ? <Badge variant="outline">History · read-only</Badge> : null}
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  Draft edits are versioned separately. Saving here never updates employee schedules.
+                </p>
+                {activeDraft ? (
+                  <p className="text-xs text-muted-foreground">
+                    Created by {activeDraft.createdByUsername} · {new Date(activeDraft.createdAt).toLocaleString("en-PH", { timeZone: "Asia/Manila", dateStyle: "medium", timeStyle: "short" })}
+                    {activeDraft.sourceMode === "REFERENCE_WEEK" && activeDraft.sourceWeekStart
+                      ? ` · Reference ${activeDraft.sourceWeekStart}`
+                      : ` · Source ${activeDraft.sourceMode.toLowerCase().replaceAll("_", " ")}`}
+                  </p>
+                ) : null}
+                {!activeDraft ? (
+                  <p className="text-xs text-muted-foreground">
+                    Choose a saved version or create a draft to edit this week.
+                  </p>
+                ) : null}
+              </div>
+              <div className="flex w-full flex-col gap-2 sm:w-auto sm:min-w-64">
+                <Select
+                  value={activeDraft?.id ?? ""}
+                  onValueChange={onDraftVersionChange}
+                  disabled={draftLoading || draftVersions.length === 0}
+                >
+                  <SelectTrigger aria-label="Select draft version" className="w-full">
+                    <SelectValue placeholder={draftLoading ? "Loading drafts…" : "Draft history"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {draftVersions.map((version) => (
+                      <SelectItem key={version.id} value={version.id}>
+                        {`v${version.version} · ${version.status} · ${version.updatedAt.slice(0, 10)}`}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {activeDraft?.isLatestVersion && activeDraft.status === "DRAFT" ? (
+                  <Button type="button" variant="outline" size="sm" onClick={onDiscardDraft} disabled={saving}>
+                    Discard latest draft
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+              <span className="mr-1 text-xs font-medium text-muted-foreground">New draft from:</span>
+              <Button type="button" size="sm" variant="outline" onClick={() => onCreateDraft("CURRENT_SCHEDULE")} disabled={saving || draftLoading}>
+                Current schedule
+              </Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => onCreateDraft("REFERENCE_WEEK")} disabled={saving || draftLoading}>
+                Reference week
+              </Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => onCreateDraft("EMPTY")} disabled={saving || draftLoading}>
+                Empty draft
+              </Button>
+              {draftError ? <span role="alert" className="text-sm text-destructive">{draftError}</span> : null}
+            </div>
+          </div>
+        ) : null}
+
+        {aiSchedulingEnabled && plannerMode === "AI_DRAFT" ? (
+          <SchedulePolicyPanel
+            departments={departments}
+            shifts={shifts}
+            activeDraft={activeDraft}
+            draftDirty={dirty}
+            onDraftGenerated={onDraftGenerated}
+            onRefresh={onRefresh}
+          />
+        ) : null}
+
+        {aiSchedulingChatEnabled && plannerMode === "AI_DRAFT" ? (
+          <ScheduleAssistantPanel
+            weekStart={weekStart}
+            referenceWeekStart={compareWeekStart}
+            departmentId={departmentId}
+            selectedEmployeeIds={selectedEmployeeIds}
+            draftId={activeDraft?.id ?? null}
+            onDraftChanged={onDraftGenerated}
+          />
+        ) : null}
 
         <div className="rounded-lg border p-4">
           <div className="mb-3">
@@ -1230,8 +1384,25 @@ export function WeekPlannerSection({
                       const day = row.days[dayKey];
                       const isLeaveDay = Boolean(day.leave);
                       const isUnassigned = day.shiftId == null && !isLeaveDay;
+                      const draftAssignment = activeDraft
+                        ? draftAssignmentsByKey.get(`${row.employee.employeeId}:${day.workDate}`)
+                        : undefined;
+                      const isChangedDraftCell = plannerMode === "AI_DRAFT" && Boolean(
+                        draftAssignment &&
+                        (
+                          draftAssignment.source === "MANUAL" ||
+                          (draftAssignment.shiftId !== draftAssignment.baselineShiftId && !(
+                            draftAssignment.source === "CURRENT_SCHEDULE" &&
+                            draftAssignment.hasBaselineOverride &&
+                            draftAssignment.shiftId === draftAssignment.baselineOverrideShiftId
+                          ))
+                        ),
+                      );
                       return (
-                        <TableCell key={`${row.employee.employeeId}-${dayKey}`} className="align-top">
+                        <TableCell
+                          key={`${row.employee.employeeId}-${dayKey}`}
+                          className={`align-top ${isChangedDraftCell ? "bg-amber-500/10 ring-1 ring-inset ring-amber-500/35" : ""}`}
+                        >
                           <div className="space-y-2">
                             <div className="grid gap-2">
                               <div className="space-y-1">
@@ -1240,52 +1411,56 @@ export function WeekPlannerSection({
                                     <div className="font-medium text-sky-200">
                                       {formatLeaveType(day.leave!.leaveType)}
                                     </div>
-                                  </div>
-                                ) : (
-                                  <div className="relative">
-                                    <select
-                                      className={`w-full rounded-md border px-2 py-2 pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 ${
-                                        isUnassigned
-                                          ? "border-amber-500/60 bg-amber-500/10 text-amber-100"
-                                          : "border-border bg-background"
-                                      }`}
-                                      style={getSelectStyle(selectedShiftById(day.shiftId))}
-                                      value={day.shiftId != null ? String(day.shiftId) : ""}
-                                      onChange={(event) =>
-                                        onChangeShift(
-                                          row.employee.employeeId,
-                                          dayKey,
-                                          event.target.value ? Number(event.target.value) : null,
-                                        )
-                                      }
-                                    >
-                                      <option value="">Unassigned</option>
-                                      {shifts.map((shift) => (
-                                        <option
-                                          key={shift.id}
-                                          value={shift.id}
-                                          style={
-                                            shift.colorHex
-                                              ? {
-                                                  color: shift.colorHex,
-                                                  backgroundColor: `${shift.colorHex}14`,
-                                                }
-                                              : undefined
-                                          }
-                                        >
-                                          {shift.code}
-                                        </option>
-                                      ))}
-                                    </select>
-                                    {!isUnassigned ? (
-                                      <CheckCircle2 className="pointer-events-none absolute right-8 top-1/2 h-4 w-4 -translate-y-1/2 text-emerald-400" />
+                                    {plannerMode === "AI_DRAFT" ? (
+                                      <div className="mt-1 text-xs text-muted-foreground">
+                                        Base shift: {formatShiftCode(selectedShiftById(day.shiftId))}
+                                      </div>
                                     ) : null}
                                   </div>
+                                ) : (
+                                  <Select
+                                    value={day.shiftId != null ? String(day.shiftId) : "__unassigned"}
+                                    disabled={plannerMode === "AI_DRAFT" && (
+                                      !activeDraft ||
+                                      !activeDraft.isLatestVersion ||
+                                      activeDraft.status === "PUBLISHED" ||
+                                      activeDraft.status === "DISCARDED"
+                                    )}
+                                    onValueChange={(value) =>
+                                      onChangeShift(
+                                        row.employee.employeeId,
+                                        dayKey,
+                                        value === "__unassigned" ? null : Number(value),
+                                      )
+                                    }
+                                  >
+                                    <SelectTrigger
+                                      className={`w-full ${isUnassigned ? "border-amber-500/60 bg-amber-500/10" : ""}`}
+                                      style={getSelectStyle(selectedShiftById(day.shiftId))}
+                                      aria-label={`${row.employee.firstName} ${row.employee.lastName} ${weekPlannerDayLabel(dayKey)} shift`}
+                                    >
+                                      <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="__unassigned">Unassigned</SelectItem>
+                                      {shifts.map((shift) => (
+                                        <SelectItem key={shift.id} value={String(shift.id)}>
+                                          {shift.code} · {shift.name}
+                                        </SelectItem>
+                                      ))}
+                                    </SelectContent>
+                                  </Select>
                                 )}
                                 <div className="text-[11px] font-medium text-muted-foreground">
-                                  {isLeaveDay
-                                    ? "Locked by leave"
-                                    : ""}
+                                  {isLeaveDay ? "Protected leave · base shift preserved" : day.hasOverride ? (
+                                    <span className="inline-flex items-center gap-1">
+                                      <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+                                        Override {day.overrideShiftId == null
+                                          ? "No shift"
+                                          : formatShiftCode(selectedShiftById(day.overrideShiftId))}
+                                      </Badge>
+                                    </span>
+                                  ) : ""}
                                 </div>
                               </div>
                               <div className="space-y-1">

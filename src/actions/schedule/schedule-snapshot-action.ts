@@ -2,11 +2,14 @@
 
 import { db } from "@/lib/db";
 import { getDailySchedule } from "@/lib/schedule";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import { serializeShift } from "@/lib/serializers/schedule";
 import { shiftSelect } from "./schedule-shared";
 
 export async function getScheduleSnapshot(dateParam?: string) {
   try {
+    await requireScheduleManager();
     const date = dateParam ? new Date(dateParam) : new Date();
     if (Number.isNaN(date.getTime())) {
       return { success: false, error: "Invalid date" };
@@ -37,6 +40,9 @@ export async function getScheduleSnapshot(dateParam?: string) {
     };
   } catch (error) {
     console.error("Failed to fetch schedule", error);
-    return { success: false, error: "Failed to load schedule" };
+    return {
+      success: false,
+      error: scheduleAccessError(error, "Failed to load schedule"),
+    };
   }
 }

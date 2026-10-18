@@ -3,6 +3,8 @@
 import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
 import { serializeShift } from "@/lib/serializers/schedule";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 
 const parseTimeToMinutes = (value: string | null | undefined) => {
   if (!value) return null;
@@ -78,6 +80,7 @@ const shiftSelect = {
 
 export async function listShifts() {
   try {
+    await requireScheduleManager();
     const shifts = await db.shift.findMany({
       where: { isActive: true },
       orderBy: [{ isDayOff: "asc" }, { startMinutes: "asc" }, { name: "asc" }],
@@ -86,7 +89,10 @@ export async function listShifts() {
     return { success: true, data: shifts.map((s) => serializeShift(s)) };
   } catch (error) {
     console.error("Failed to list shifts", error);
-    return { success: false, error: "Failed to load shifts" };
+    return {
+      success: false,
+      error: scheduleAccessError(error, "Failed to load shifts"),
+    };
   }
 }
 
@@ -103,6 +109,7 @@ export async function createShift(input: {
   isDayOff?: boolean;
 }) {
   try {
+    await requireScheduleManager();
     const isDayOff = Boolean(input.isDayOff);
     const code = (typeof input.code === "string" ? input.code.trim() : "") || (isDayOff ? "OFF" : "");
     const name =
@@ -170,7 +177,7 @@ export async function createShift(input: {
     console.error("Failed to create shift", error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : "Failed to create shift",
+      error: scheduleAccessError(error, "Failed to create shift"),
     };
   }
 }
@@ -189,6 +196,7 @@ export async function updateShift(input: {
   isDayOff?: boolean;
 }) {
   try {
+    await requireScheduleManager();
     const id = typeof input.id === "number" ? input.id : null;
     if (!id) {
       return { success: false, error: "id is required" };
@@ -301,13 +309,14 @@ export async function updateShift(input: {
     console.error("Failed to update shift", error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : "Failed to update shift",
+      error: scheduleAccessError(error, "Failed to update shift"),
     };
   }
 }
 
 export async function deleteShift(id: number) {
   try {
+    await requireScheduleManager();
     if (!id || Number.isNaN(Number(id))) {
       return { success: false, error: "id is required" };
     }
@@ -327,7 +336,7 @@ export async function deleteShift(id: number) {
     console.error("Failed to archive shift", error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : "Failed to archive shift",
+      error: scheduleAccessError(error, "Failed to archive shift"),
     };
   }
 }

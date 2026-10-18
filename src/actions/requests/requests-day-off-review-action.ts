@@ -1,13 +1,13 @@
 "use server";
 
 import { ATTENDANCE_STATUS, DayOffRequestStatus } from "@prisma/client";
-import { getSession } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import { startOfZonedDay } from "@/lib/timezone";
 import { requestReviewSchema } from "@/lib/validations/requests";
 import {
   buildDayOffPreview,
-  canReviewRequests,
   employeeRequestSelect,
   getScheduleSwapBlockingIssue,
   revalidateRequestLayouts,
@@ -27,13 +27,7 @@ export async function reviewDayOffRequest(
   error?: string;
 }> {
   try {
-    const session = await getSession();
-    if (!session?.isLoggedIn || !canReviewRequests(session.role)) {
-      return {
-        success: false,
-        error: "You are not allowed to review day off requests.",
-      };
-    }
+    const actor = await requireScheduleManager();
 
     const parsed = requestReviewSchema.safeParse(input);
     if (!parsed.success) {
@@ -75,7 +69,7 @@ export async function reviewDayOffRequest(
         data: {
           status: DayOffRequestStatus.REJECTED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -89,7 +83,7 @@ export async function reviewDayOffRequest(
         eventType: "DAY_OFF_REQUEST_REJECTED",
         title: "Day off request rejected",
         message: "Your day off request was rejected.",
-        actorUserId: session.userId ?? null,
+        actorUserId: actor.userId,
         employeeId: reviewed.employee.employeeId,
         entityType: "DayOffRequest",
         entityId: reviewed.id,
@@ -241,7 +235,7 @@ export async function reviewDayOffRequest(
         data: {
           status: DayOffRequestStatus.APPROVED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -256,7 +250,7 @@ export async function reviewDayOffRequest(
       eventType: "DAY_OFF_REQUEST_APPROVED",
         title: "Day off request approved",
         message: "Your change day off request was approved.",
-      actorUserId: session.userId ?? null,
+      actorUserId: actor.userId,
       employeeId: reviewed.employee.employeeId,
       entityType: "DayOffRequest",
       entityId: reviewed.id,
@@ -265,6 +259,13 @@ export async function reviewDayOffRequest(
     return { success: true, data: serializeDayOffRequest(reviewed) };
   } catch (error) {
     console.error("Error reviewing day off request:", error);
-    return { success: false, error: "Failed to review day off request." };
+    const accessError = scheduleAccessError(error, "Failed to review day off request.");
+    return {
+      success: false,
+      error:
+        accessError === "Unauthorized" || accessError === "Forbidden"
+          ? "You are not allowed to review day off requests."
+          : accessError,
+    };
   }
 }

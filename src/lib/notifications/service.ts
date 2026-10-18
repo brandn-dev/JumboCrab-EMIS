@@ -191,25 +191,37 @@ export async function createNotification(input: CreateNotificationInput) {
     };
   }
 
-  const rows = await db.$transaction(async (tx) => {
-    const notification = await tx.notification.create({
-      data: {
-        eventType: input.eventType,
-        module: input.module,
-        title: input.title,
-        message: input.message,
-        severity: input.severity,
-        actorUserId: input.actorUserId ?? null,
-        entityType: input.entityType ?? null,
-        entityId: input.entityId ?? null,
-        linkHref: input.linkHref,
-        metadata: input.metadata
-          ? (input.metadata as Prisma.InputJsonValue)
-          : undefined,
-        emailEligible: Boolean(input.emailEligible),
-      },
-      select: { id: true },
-    });
+  const dedupeKey = input.dedupeKey?.trim() || null;
+  const existingNotification = dedupeKey
+    ? await db.notification.findUnique({ where: { dedupeKey }, select: { id: true } })
+    : null;
+  const { rows, notificationId } = await db.$transaction(async (tx) => {
+    const notificationData = {
+      eventType: input.eventType,
+      module: input.module,
+      title: input.title,
+      message: input.message,
+      severity: input.severity,
+      actorUserId: input.actorUserId ?? null,
+      entityType: input.entityType ?? null,
+      entityId: input.entityId ?? null,
+      linkHref: input.linkHref,
+      metadata: input.metadata
+        ? (input.metadata as Prisma.InputJsonValue)
+        : undefined,
+      emailEligible: Boolean(input.emailEligible),
+    } satisfies Prisma.NotificationUncheckedCreateInput;
+    const notification = dedupeKey
+      ? await tx.notification.upsert({
+          where: { dedupeKey },
+          update: {},
+          create: { ...notificationData, dedupeKey },
+          select: { id: true },
+        })
+      : await tx.notification.create({
+          data: notificationData,
+          select: { id: true },
+        });
 
     await tx.userNotification.createMany({
       data: recipientUserIds.map((userId) => ({
@@ -222,13 +234,14 @@ export async function createNotification(input: CreateNotificationInput) {
       skipDuplicates: true,
     });
 
-    return tx.userNotification.findMany({
+    const rows = await tx.userNotification.findMany({
       where: {
         notificationId: notification.id,
         userId: { in: recipientUserIds },
       },
       include: userNotificationInclude,
     });
+    return { rows, notificationId: notification.id };
   });
 
   const userRoles = await db.user.findMany({
@@ -263,19 +276,21 @@ export async function createNotification(input: CreateNotificationInput) {
     unreadCounts.map((row) => [row.userId, row._count._all]),
   );
 
-  await Promise.all(
-    items.map((item, index) =>
-      publishNotificationEvent({
-        userId: rows[index]!.userId,
-        unreadCount: unreadCountByUserId.get(rows[index]!.userId) ?? 0,
-        item,
-        publishedAt: new Date().toISOString(),
-      }),
-    ),
-  );
+  if (!existingNotification) {
+    await Promise.all(
+      items.map((item, index) =>
+        publishNotificationEvent({
+          userId: rows[index]!.userId,
+          unreadCount: unreadCountByUserId.get(rows[index]!.userId) ?? 0,
+          item,
+          publishedAt: new Date().toISOString(),
+        }),
+      ),
+    );
+  }
 
   return {
-    notificationId: rows[0]?.notificationId ?? null,
+    notificationId,
     items,
     recipientUserIds,
   };

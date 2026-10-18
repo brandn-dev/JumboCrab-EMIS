@@ -1,0 +1,2 @@
+ALTER TABLE "Violation"
+ADD COLUMN "maxStrikesPerEmployee" INTEGER NOT NULL DEFAULT 3;

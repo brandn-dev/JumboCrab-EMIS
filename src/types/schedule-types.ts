@@ -77,6 +77,8 @@ export type WeekPlannerDayDraft = {
   shift: ShiftLite | null;
   compareShiftId: number | null;
   compareShift: ShiftLite | null;
+  hasOverride: boolean;
+  overrideShiftId: number | null;
   leave: WeekPlannerLeaveInfo | null;
 };
 
@@ -189,6 +191,8 @@ type WeekPlannerDayDraftInput = {
   shift?: ShiftInput | null;
   compareShiftId?: number | null;
   compareShift?: ShiftInput | null;
+  hasOverride?: boolean;
+  overrideShiftId?: number | null;
   leave?: WeekPlannerLeaveInfo | null;
 };
 
@@ -285,6 +289,8 @@ export const normalizeWeekPlannerRow = (row: WeekPlannerRowInput): WeekPlannerRo
             ? day.compareShiftId
             : day?.compareShift?.id ?? null,
         compareShift: day?.compareShift ? normalizeShift(day.compareShift) : null,
+        hasOverride: Boolean(day?.hasOverride),
+        overrideShiftId: typeof day?.overrideShiftId === "number" ? day.overrideShiftId : null,
         leave: day?.leave ?? null,
       };
       return acc;

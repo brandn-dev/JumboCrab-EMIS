@@ -42,6 +42,7 @@ export type NotificationRecipientInput = {
 };
 
 export type CreateNotificationInput = {
+  dedupeKey?: string | null;
   eventType: NotificationEventType;
   module: NotificationModule;
   title: string;

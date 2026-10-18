@@ -85,6 +85,36 @@ const normalizeInputDate = (value?: string | Date | null) => {
   return new Date(value);
 };
 
+export const parsePlannerDateInput = (value: string) => {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) return null;
+
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (dateOnly) {
+    const year = Number(dateOnly[1]);
+    const month = Number(dateOnly[2]);
+    const day = Number(dateOnly[3]);
+    const parsed = new Date(Date.UTC(year, month - 1, day, 12));
+    if (
+      parsed.getUTCFullYear() !== year ||
+      parsed.getUTCMonth() !== month - 1 ||
+      parsed.getUTCDate() !== day
+    ) {
+      return null;
+    }
+    return parsed;
+  }
+
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+};
+
+export const parseWeekStartInput = (value: string) => {
+  const parsed = parsePlannerDateInput(value);
+  return parsed ? normalizeWeekStart(parsed) : null;
+};
+
 const addDays = (date: Date, days: number) =>
   new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 

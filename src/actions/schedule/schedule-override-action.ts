@@ -2,11 +2,14 @@
 
 import { db } from "@/lib/db";
 import { serializeShift } from "@/lib/serializers/schedule";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import {
   endOfZonedDay,
   startOfZonedDay,
   zonedNow,
 } from "@/lib/timezone";
+import { parsePlannerDateInput } from "@/lib/week-planner";
 import { shiftSelect } from "./schedule-shared";
 
 export async function listScheduleOverrides(input?: {
@@ -14,6 +17,7 @@ export async function listScheduleOverrides(input?: {
   end?: string;
 }) {
   try {
+    await requireScheduleManager();
     const startInput = input?.start ? new Date(input.start) : zonedNow();
     const endInput = input?.end ? new Date(input.end) : null;
 
@@ -65,7 +69,10 @@ export async function listScheduleOverrides(input?: {
     return { success: true, data };
   } catch (error) {
     console.error("Failed to list overrides", error);
-    return { success: false, error: "Failed to load overrides" };
+    return {
+      success: false,
+      error: scheduleAccessError(error, "Failed to load overrides"),
+    };
   }
 }
 
@@ -76,6 +83,7 @@ export async function upsertScheduleOverride(input: {
   source?: string | null;
 }) {
   try {
+    await requireScheduleManager();
     const employeeId =
       typeof input.employeeId === "string" && input.employeeId.trim()
         ? input.employeeId.trim()
@@ -91,8 +99,8 @@ export async function upsertScheduleOverride(input: {
       return { success: false, error: "employeeId is required" };
     }
 
-    const workDateInput = workDateRaw ? new Date(workDateRaw) : new Date();
-    if (Number.isNaN(workDateInput.getTime())) {
+    const workDateInput = parsePlannerDateInput(workDateRaw);
+    if (!workDateInput) {
       return { success: false, error: "workDate is invalid" };
     }
     const workDate = startOfZonedDay(workDateInput);
@@ -142,12 +150,16 @@ export async function upsertScheduleOverride(input: {
     };
   } catch (error) {
     console.error("Failed to save override", error);
-    return { success: false, error: "Failed to save override" };
+    return {
+      success: false,
+      error: scheduleAccessError(error, "Failed to save override"),
+    };
   }
 }
 
 export async function deleteScheduleOverride(id: string) {
   try {
+    await requireScheduleManager();
     const overrideId = typeof id === "string" ? id.trim() : "";
     if (!overrideId) {
       return { success: false, error: "id is required" };
@@ -163,6 +175,9 @@ export async function deleteScheduleOverride(id: string) {
     return { success: true };
   } catch (error) {
     console.error("Failed to delete override", error);
-    return { success: false, error: "Failed to delete override" };
+    return {
+      success: false,
+      error: scheduleAccessError(error, "Failed to delete override"),
+    };
   }
 }

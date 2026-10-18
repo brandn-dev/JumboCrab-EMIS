@@ -3,20 +3,21 @@
 import { CURRENT_STATUS, LeaveRequestStatus } from "@prisma/client";
 import type { LeaveRequestType } from "@prisma/client";
 import { db } from "@/lib/db";
-import { getSession } from "@/lib/auth";
-import { normalizeRole } from "@/lib/rbac";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import { getExpectedShiftForDate } from "@/lib/attendance";
 import { serializeShift } from "@/lib/serializers/schedule";
 import { endOfZonedDay, startOfZonedDay } from "@/lib/timezone";
+import { persistWeekPlannerAssignments } from "@/lib/week-planner-persistence";
 import {
   computeCoverageSummary,
   getWeekDates,
   normalizeWeekStart,
+  parseWeekStartInput,
   toPlannerDateKey,
   WEEK_SHIFT_FIELD_MAP,
   WEEK_PLANNER_DAYS,
   type WeekPlannerDayKey,
-  type WeekShiftMap,
 } from "@/lib/week-planner";
 import { shiftSelect } from "./schedule-shared";
 
@@ -29,27 +30,6 @@ const employeeSelect = {
   department: { select: { departmentId: true, name: true } },
   position: { select: { name: true } },
 } as const;
-
-const ensureWeekPlannerAccess = async () => {
-  const session = await getSession();
-  const role = normalizeRole(session.role);
-  if (!session.isLoggedIn || !role) {
-    throw new Error("Unauthorized");
-  }
-  if (role !== "admin" && role !== "manager") {
-    throw new Error("Forbidden");
-  }
-};
-
-const buildEmptyWeekMap = (): WeekShiftMap => ({
-  mon: null,
-  tue: null,
-  wed: null,
-  thu: null,
-  fri: null,
-  sat: null,
-  sun: null,
-});
 
 const addDays = (date: Date, days: number) =>
   new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
@@ -175,6 +155,8 @@ const resolveWeekForEmployee = async (
         dayKey,
         workDate: toPlannerDateKey(date),
         shift: expected.shift ? serializeShift(expected.shift) : null,
+        hasOverride: expected.source === "override",
+        overrideShiftId: expected.source === "override" ? expected.shift?.id ?? null : null,
         leave: leaveMap?.get(`${employeeId}:${toPlannerDateKey(date)}`) ?? null,
       };
     }),
@@ -186,6 +168,8 @@ const resolveWeekForEmployee = async (
         workDate: entry.workDate,
         shiftId: entry.shift?.id ?? null,
         shift: entry.shift,
+        hasOverride: entry.hasOverride,
+        overrideShiftId: entry.overrideShiftId,
         leave: entry.leave,
       };
       return acc;
@@ -196,6 +180,8 @@ const resolveWeekForEmployee = async (
         workDate: string;
         shiftId: number | null;
         shift: ReturnType<typeof serializeShift>;
+        hasOverride: boolean;
+        overrideShiftId: number | null;
         leave: {
           leaveType: LeaveRequestType;
           isPaidLeave: boolean;
@@ -210,12 +196,19 @@ export async function getWeekPlannerSnapshot(input?: {
   compareWeekStart?: string;
 }) {
   try {
-    await ensureWeekPlannerAccess();
+    await requireScheduleManager();
 
-    const weekStart = normalizeWeekStart(input?.weekStart);
+    const weekStart = input?.weekStart
+      ? parseWeekStartInput(input.weekStart)
+      : normalizeWeekStart();
+    if (!weekStart) return { success: false, error: "Invalid weekStart" };
+
     const compareWeekStart = input?.compareWeekStart
-      ? normalizeWeekStart(input.compareWeekStart)
+      ? parseWeekStartInput(input.compareWeekStart)
       : new Date(weekStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+    if (!compareWeekStart) {
+      return { success: false, error: "Invalid compareWeekStart" };
+    }
 
     const [employees, departments, shifts] = await Promise.all([
       db.employee.findMany({
@@ -266,6 +259,8 @@ export async function getWeekPlannerSnapshot(input?: {
               shift: targetWeek[dayKey].shift,
               compareShiftId: compareWeek[dayKey].shiftId,
               compareShift: compareWeek[dayKey].shift,
+              hasOverride: targetWeek[dayKey].hasOverride,
+              overrideShiftId: targetWeek[dayKey].overrideShiftId,
               leave: targetWeek[dayKey].leave,
             };
             return acc;
@@ -279,6 +274,8 @@ export async function getWeekPlannerSnapshot(input?: {
               shift: ReturnType<typeof serializeShift>;
 	              compareShiftId: number | null;
 	              compareShift: ReturnType<typeof serializeShift>;
+              hasOverride: boolean;
+              overrideShiftId: number | null;
 	              leave: {
 	                leaveType: LeaveRequestType;
 	                isPaidLeave: boolean;
@@ -311,11 +308,7 @@ export async function getWeekPlannerSnapshot(input?: {
     console.error("Failed to load week planner snapshot", error);
     return {
       success: false,
-      error:
-        error instanceof Error &&
-        (error.message === "Unauthorized" || error.message === "Forbidden")
-          ? error.message
-          : "Failed to load week planner snapshot",
+      error: scheduleAccessError(error, "Failed to load week planner snapshot"),
     };
   }
 }
@@ -328,13 +321,16 @@ export async function saveWeekPlannerAssignments(input: {
   }>;
 }) {
   try {
-    await ensureWeekPlannerAccess();
+    await requireScheduleManager();
 
     if (!Array.isArray(input?.rows) || input.rows.length === 0) {
       return { success: false, error: "At least one row is required" };
     }
 
-    const weekStart = normalizeWeekStart(input.weekStart);
+    const weekStart = parseWeekStartInput(input.weekStart);
+    if (!weekStart) {
+      return { success: false, error: "Invalid weekStart" };
+    }
     const employeeIds = input.rows
       .map((row) => row.employeeId?.trim())
       .filter((employeeId): employeeId is string => Boolean(employeeId));
@@ -379,68 +375,14 @@ export async function saveWeekPlannerAssignments(input: {
       return { success: false, error: "One or more shifts were not found" };
     }
 
-    await db.$transaction(
-      input.rows.map((row) => {
-        const weekMap = WEEK_PLANNER_DAYS.reduce(
-          (acc, dayKey) => {
-            acc[dayKey] =
-              typeof row.days?.[dayKey] === "number" ? row.days[dayKey]! : null;
-            return acc;
-          },
-          buildEmptyWeekMap(),
-        );
-
-        const hasAnyValue = WEEK_PLANNER_DAYS.some((dayKey) => weekMap[dayKey] != null);
-        if (!hasAnyValue) {
-          return db.weeklySchedule.deleteMany({
-            where: {
-              employeeId: row.employeeId,
-              weekStart,
-            },
-          });
-        }
-
-        return db.weeklySchedule.upsert({
-          where: {
-            employeeId_weekStart: {
-              employeeId: row.employeeId,
-              weekStart,
-            },
-          },
-          update: {
-            monShiftId: weekMap.mon,
-            tueShiftId: weekMap.tue,
-            wedShiftId: weekMap.wed,
-            thuShiftId: weekMap.thu,
-            friShiftId: weekMap.fri,
-            satShiftId: weekMap.sat,
-            sunShiftId: weekMap.sun,
-          },
-          create: {
-            employeeId: row.employeeId,
-            weekStart,
-            monShiftId: weekMap.mon,
-            tueShiftId: weekMap.tue,
-            wedShiftId: weekMap.wed,
-            thuShiftId: weekMap.thu,
-            friShiftId: weekMap.fri,
-            satShiftId: weekMap.sat,
-            sunShiftId: weekMap.sun,
-          },
-        });
-      }),
-    );
+    await persistWeekPlannerAssignments(db, weekStart, input.rows);
 
     return { success: true };
   } catch (error) {
     console.error("Failed to save week planner", error);
     return {
       success: false,
-      error:
-        error instanceof Error &&
-        (error.message === "Unauthorized" || error.message === "Forbidden")
-          ? error.message
-          : "Failed to save week planner",
+      error: scheduleAccessError(error, "Failed to save week planner"),
     };
   }
 }

@@ -8,6 +8,11 @@ import {
 } from "date-fns";
 import { db } from "@/lib/db";
 import { getExpectedShiftForDate } from "@/lib/attendance";
+import { requireScheduleActor } from "@/lib/scheduling-auth";
+import {
+  canReadEmployeeSchedule,
+  scheduleAccessError,
+} from "@/lib/scheduling-access";
 import { serializeShift } from "@/lib/serializers/schedule";
 import {
   endOfZonedDay,
@@ -32,6 +37,7 @@ export async function getEmployeeMonthSchedule(input: {
   anchorDate?: string | null;
 }) {
   try {
+    const actor = await requireScheduleActor();
     const employeeId =
       typeof input?.employeeId === "string" ? input.employeeId.trim() : "";
     const anchorDateRaw =
@@ -43,9 +49,13 @@ export async function getEmployeeMonthSchedule(input: {
 
     const employee = await db.employee.findUnique({
       where: { employeeId },
-      select: { employeeId: true },
+      select: {
+        employeeId: true,
+        userId: true,
+        supervisorUserId: true,
+      },
     });
-    if (!employee) {
+    if (!employee || !canReadEmployeeSchedule(actor, employee)) {
       return { success: false, error: "Employee not found" };
     }
 
@@ -145,6 +155,9 @@ export async function getEmployeeMonthSchedule(input: {
     };
   } catch (error) {
     console.error("Failed to fetch employee month schedule", error);
-    return { success: false, error: "Failed to load employee schedule" };
+    return {
+      success: false,
+      error: scheduleAccessError(error, "Failed to load employee schedule"),
+    };
   }
 }

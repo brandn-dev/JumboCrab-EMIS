@@ -2,6 +2,11 @@
 
 This file gives coding agents and contributors project-specific guidance for working in **JumboCrab-EMIS**.
 
+## Communication style
+
+- Use the `caveman:caveman` skill in every chat for this project, at its default `full` intensity, until the user asks for normal mode or another level.
+- Keep technical explanations accurate and terse. Leave code, commits, and PR text in normal professional style.
+
 ## Project overview
 
 - Framework: **Next.js** with the App Router
@@ -112,7 +117,7 @@ Before adding a new utility, search for an existing helper first.
 ## UI and form guidance
 
 - This repo already uses React Hook Form, Zod, **shadcn/ui**, and Tailwind-based utilities.
-- **shadcn/ui** in this repo is built on Radix primitives, so follow existing component patterns instead of introducing a different UI system.
+- Align every UI component used, added, or changed in this project with **shadcn/ui** conventions and existing component patterns. Reuse or extend the project's shadcn/ui components instead of introducing a different UI system.
 - Prefer these existing tools over introducing new form or component libraries.
 - Keep forms aligned with domain terminology already used in Prisma and the app.
 - For employee/payroll/schedule flows, clarity matters more than flashy UI.

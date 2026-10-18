@@ -2,12 +2,12 @@
 
 import { ATTENDANCE_STATUS, LeaveRequestStatus } from "@prisma/client";
 import { getExpectedShiftForDate } from "@/lib/attendance";
-import { getSession } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import { leaveReviewSchema } from "@/lib/validations/requests";
 import {
   DAY_MS,
-  canReviewRequests,
   employeeRequestSelect,
   enumerateZonedDaysInclusive,
   revalidateRequestLayouts,
@@ -32,13 +32,7 @@ export async function reviewLeaveRequest(
   error?: string;
 }> {
   try {
-    const session = await getSession();
-    if (!session?.isLoggedIn || !canReviewRequests(session.role)) {
-      return {
-        success: false,
-        error: "You are not allowed to review leave requests.",
-      };
-    }
+    const actor = await requireScheduleManager();
 
     const parsed = leaveReviewSchema.safeParse(input);
     if (!parsed.success) {
@@ -88,7 +82,7 @@ export async function reviewLeaveRequest(
         data: {
           status: LeaveRequestStatus.REJECTED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -108,7 +102,7 @@ export async function reviewLeaveRequest(
         eventType: "LEAVE_REQUEST_REJECTED",
         title: "Leave request rejected",
         message: "Your leave request was rejected.",
-        actorUserId: session.userId ?? null,
+        actorUserId: actor.userId,
         employeeId: reviewed.employee.employeeId,
         entityType: "LeaveRequest",
         entityId: reviewed.id,
@@ -276,7 +270,7 @@ export async function reviewLeaveRequest(
           days: leaveDays.length,
           effectiveDate: reviewedAt,
           leaveRequestId: existing.id,
-          createdByUserId: session.userId ?? null,
+          createdByUserId: actor.userId,
         });
       }
 
@@ -285,7 +279,7 @@ export async function reviewLeaveRequest(
         data: {
           status: LeaveRequestStatus.APPROVED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -313,7 +307,7 @@ export async function reviewLeaveRequest(
       eventType: "LEAVE_REQUEST_APPROVED",
       title: "Leave request approved",
       message: "Your leave request was approved.",
-      actorUserId: session.userId ?? null,
+      actorUserId: actor.userId,
       employeeId: reviewed.employee.employeeId,
       entityType: "LeaveRequest",
       entityId: reviewed.id,
@@ -322,6 +316,13 @@ export async function reviewLeaveRequest(
     return { success: true, data: serializeLeaveRequest(reviewed) };
   } catch (error) {
     console.error("Error reviewing leave request:", error);
-    return { success: false, error: "Failed to review leave request." };
+    const accessError = scheduleAccessError(error, "Failed to review leave request.");
+    return {
+      success: false,
+      error:
+        accessError === "Unauthorized" || accessError === "Forbidden"
+          ? "You are not allowed to review leave requests."
+          : accessError,
+    };
   }
 }

@@ -2,13 +2,13 @@
 
 import { ScheduleChangeRequestStatus } from "@prisma/client";
 import { getExpectedShiftForDate } from "@/lib/attendance";
-import { getSession } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import { startOfZonedDay } from "@/lib/timezone";
 import { requestReviewSchema } from "@/lib/validations/requests";
 import {
   buildScheduleChangePreview,
-  canReviewRequests,
   enumerateZonedDaysInclusive,
   employeeRequestSelect,
   getScheduleSwapBlockingIssue,
@@ -32,13 +32,7 @@ export async function reviewScheduleChangeRequest(
   error?: string;
 }> {
   try {
-    const session = await getSession();
-    if (!session?.isLoggedIn || !canReviewRequests(session.role)) {
-      return {
-        success: false,
-        error: "You are not allowed to review schedule change requests.",
-      };
-    }
+    const actor = await requireScheduleManager();
 
     const parsed = requestReviewSchema.safeParse(input);
     if (!parsed.success) {
@@ -80,7 +74,7 @@ export async function reviewScheduleChangeRequest(
         data: {
           status: ScheduleChangeRequestStatus.REJECTED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -94,7 +88,7 @@ export async function reviewScheduleChangeRequest(
         eventType: "SCHEDULE_CHANGE_REQUEST_REJECTED",
         title: "Schedule change request rejected",
         message: "Your schedule change request was rejected.",
-        actorUserId: session.userId ?? null,
+        actorUserId: actor.userId,
         employeeId: reviewed.employee.employeeId,
         entityType: "ScheduleChangeRequest",
         entityId: reviewed.id,
@@ -196,7 +190,7 @@ export async function reviewScheduleChangeRequest(
         data: {
           status: ScheduleChangeRequestStatus.APPROVED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -211,7 +205,7 @@ export async function reviewScheduleChangeRequest(
       eventType: "SCHEDULE_CHANGE_REQUEST_APPROVED",
       title: "Schedule change request approved",
       message: "Your schedule change request was approved.",
-      actorUserId: session.userId ?? null,
+      actorUserId: actor.userId,
       employeeId: reviewed.employee.employeeId,
       entityType: "ScheduleChangeRequest",
       entityId: reviewed.id,
@@ -220,9 +214,16 @@ export async function reviewScheduleChangeRequest(
     return { success: true, data: serializeScheduleChangeRequest(reviewed) };
   } catch (error) {
     console.error("Error reviewing schedule change request:", error);
+    const accessError = scheduleAccessError(
+      error,
+      "Failed to review schedule change request.",
+    );
     return {
       success: false,
-      error: "Failed to review schedule change request.",
+      error:
+        accessError === "Unauthorized" || accessError === "Forbidden"
+          ? "You are not allowed to review schedule change requests."
+          : accessError,
     };
   }
 }

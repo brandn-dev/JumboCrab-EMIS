@@ -3,6 +3,8 @@
 import { ScheduleSwapRequestStatus } from "@prisma/client";
 import { getSession } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { requireScheduleManager } from "@/lib/scheduling-auth";
+import { scheduleAccessError } from "@/lib/scheduling-access";
 import { startOfZonedDay } from "@/lib/timezone";
 import {
   scheduleSwapCoworkerReviewSchema,
@@ -11,7 +13,6 @@ import {
 import {
   buildScheduleSwapPreview,
   canCreateEmployeeRequests,
-  canReviewRequests,
   employeeRequestSelect,
   getEmployeeForSession,
   getScheduleSwapBlockingIssue,
@@ -155,13 +156,7 @@ export async function reviewScheduleSwapRequest(
   error?: string;
 }> {
   try {
-    const session = await getSession();
-    if (!session?.isLoggedIn || !canReviewRequests(session.role)) {
-      return {
-        success: false,
-        error: "You are not allowed to review schedule swap requests.",
-      };
-    }
+    const actor = await requireScheduleManager();
 
     const parsed = scheduleSwapManagerReviewSchema.safeParse(input);
     if (!parsed.success) {
@@ -207,7 +202,7 @@ export async function reviewScheduleSwapRequest(
         data: {
           status: ScheduleSwapRequestStatus.REJECTED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -220,7 +215,7 @@ export async function reviewScheduleSwapRequest(
       revalidateRequestLayouts();
       await notifySwapRequester({
         eventType: "SCHEDULE_SWAP_REQUEST_REJECTED",
-        actorUserId: session.userId ?? null,
+        actorUserId: actor.userId,
         requesterEmployeeId: reviewed.requesterEmployee.employeeId,
         requestId: reviewed.id,
         title: "Schedule swap request rejected",
@@ -230,7 +225,7 @@ export async function reviewScheduleSwapRequest(
         eventType: "SCHEDULE_SWAP_REQUEST_REJECTED",
         title: "Schedule swap request rejected",
         message: "A schedule swap request involving you was rejected by management.",
-        actorUserId: session.userId ?? null,
+        actorUserId: actor.userId,
         employeeId: reviewed.coworkerEmployee.employeeId,
         entityType: "ScheduleSwapRequest",
         entityId: reviewed.id,
@@ -374,7 +369,7 @@ export async function reviewScheduleSwapRequest(
         data: {
           status: ScheduleSwapRequestStatus.APPROVED,
           managerRemarks: parsed.data.managerRemarks ?? null,
-          reviewedByUserId: session.userId ?? null,
+          reviewedByUserId: actor.userId,
           reviewedAt,
         },
         include: {
@@ -388,7 +383,7 @@ export async function reviewScheduleSwapRequest(
     revalidateRequestLayouts();
     await notifySwapRequester({
       eventType: "SCHEDULE_SWAP_REQUEST_APPROVED",
-      actorUserId: session.userId ?? null,
+      actorUserId: actor.userId,
       requesterEmployeeId: reviewed.requesterEmployee.employeeId,
       requestId: reviewed.id,
       title: "Schedule swap request approved",
@@ -398,7 +393,7 @@ export async function reviewScheduleSwapRequest(
       eventType: "SCHEDULE_SWAP_REQUEST_APPROVED",
       title: "Schedule swap request approved",
       message: "A schedule swap request involving you was approved.",
-      actorUserId: session.userId ?? null,
+      actorUserId: actor.userId,
       employeeId: reviewed.coworkerEmployee.employeeId,
       entityType: "ScheduleSwapRequest",
       entityId: reviewed.id,
@@ -407,6 +402,16 @@ export async function reviewScheduleSwapRequest(
     return { success: true, data: serializeScheduleSwapRequest(reviewed) };
   } catch (error) {
     console.error("Error reviewing schedule swap request:", error);
-    return { success: false, error: "Failed to review schedule swap request." };
+    const accessError = scheduleAccessError(
+      error,
+      "Failed to review schedule swap request.",
+    );
+    return {
+      success: false,
+      error:
+        accessError === "Unauthorized" || accessError === "Forbidden"
+          ? "You are not allowed to review schedule swap requests."
+          : accessError,
+    };
   }
 }

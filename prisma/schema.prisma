@@ -8,57 +8,63 @@ datasource db {
 }
 
 model User {
-  userId                            String                        @id @default(cuid())
-  username                          String                        @unique
-  email                             String                        @unique
-  password                          String
-  salt                              String
-  role                              Roles
-  createdAt                         DateTime                      @default(now())
-  updatedAt                         DateTime                      @updatedAt
-  isDisabled                        Boolean                       @default(false)
-  mustChangePassword                Boolean                       @default(false)
-  passwordChangedAt                 DateTime?
-  employeeProfileId                 String?                       @unique
-  employee                          Employee?
-  employeeProfile                   Employee?                     @relation("UserEmployeeProfile", fields: [employeeProfileId], references: [employeeId])
+  userId                             String                            @id @default(cuid())
+  username                           String                            @unique
+  email                              String                            @unique
+  password                           String
+  salt                               String
+  role                               Roles
+  createdAt                          DateTime                          @default(now())
+  updatedAt                          DateTime                          @updatedAt
+  isDisabled                         Boolean                           @default(false)
+  mustChangePassword                 Boolean                           @default(false)
+  passwordChangedAt                  DateTime?
+  employeeProfileId                  String?                           @unique
+  employee                           Employee?
+  employeeProfile                    Employee?                         @relation("UserEmployeeProfile", fields: [employeeProfileId], references: [employeeId])
   // Users who supervise employees
-  supervisedEmployees               Employee[]                    @relation("EmployeeSupervisorUser")
-  draftedViolations                 EmployeeViolation[]           @relation("EmployeeViolationDraftedBy")
-  reviewedViolations                EmployeeViolation[]           @relation("EmployeeViolationReviewedBy")
-  createdViolationResets            EmployeeViolationReset[]      @relation("EmployeeViolationResetCreatedBy")
-  createdViolationAutoResetPolicies ViolationAutoResetPolicy[]    @relation("ViolationAutoResetPolicyCreatedBy")
-  createdPayrolls                   Payroll[]                     @relation("PayrollCreatedBy")
-  managerReviewedPayrolls           Payroll[]                     @relation("PayrollManagerReviewedBy")
-  gmReviewedPayrolls                Payroll[]                     @relation("PayrollGmReviewedBy")
-  releasedPayrolls                  Payroll[]                     @relation("PayrollReleasedBy")
-  createdPayrollEmployees           PayrollEmployee[]             @relation("PayrollEmployeeCreatedBy")
-  updatedPayrollEmployees           PayrollEmployee[]             @relation("PayrollEmployeeUpdatedBy")
-  createdPayrollEarnings            PayrollEarning[]              @relation("PayrollEarningCreatedBy")
-  createdPayrollDeductions          PayrollDeduction[]            @relation("PayrollDeductionCreatedBy")
-  createdContributionBracketVersions ContributionBracketVersion[]  @relation("ContributionBracketVersionCreatedBy")
-  createdPositionRateHistories      PositionRateHistory[]         @relation("PositionRateHistoryCreatedBy")
-  createdEmployeePositionHistories  EmployeePositionHistory[]     @relation("EmployeePositionHistoryCreatedBy")
-  createdDeductionTypes             DeductionType[]               @relation("DeductionTypeCreatedBy")
-  updatedDeductionTypes             DeductionType[]               @relation("DeductionTypeUpdatedBy")
-  assignedEmployeeDeductions        EmployeeDeductionAssignment[] @relation("EmployeeDeductionAssignmentAssignedBy")
-  updatedEmployeeDeductions         EmployeeDeductionAssignment[] @relation("EmployeeDeductionAssignmentUpdatedBy")
-  reviewedEmployeeDeductions        EmployeeDeductionAssignment[] @relation("EmployeeDeductionAssignmentReviewedBy")
-  recordedEmployeeDeductionPayments EmployeeDeductionPayment[]    @relation("EmployeeDeductionPaymentCreatedBy")
-  reviewedCashAdvanceRequests       CashAdvanceRequest[]          @relation("CashAdvanceRequestReviewedBy")
-  reviewedGovernmentLoanRequests    GovernmentLoanAssistanceRequest[] @relation("GovernmentLoanAssistanceRequestReviewedBy")
-  reviewedSilEncashmentRequests     SilEncashmentRequest[]        @relation("SilEncashmentRequestReviewedBy")
-  reviewedLeaveRequests             LeaveRequest[]                @relation("LeaveRequestReviewedBy")
-  reviewedDayOffRequests            DayOffRequest[]               @relation("DayOffRequestReviewedBy")
-  reviewedScheduleChangeRequests    ScheduleChangeRequest[]       @relation("ScheduleChangeRequestReviewedBy")
-  reviewedScheduleSwapRequests      ScheduleSwapRequest[]         @relation("ScheduleSwapRequestReviewedBy")
-  initiatedLeaveCreditResetRuns     LeaveCreditResetRun[]         @relation("LeaveCreditResetRunInitiatedBy")
-  createdLeaveCreditLedgerEntries   EmployeeLeaveCreditLedger[]   @relation("EmployeeLeaveCreditLedgerCreatedBy")
-  updatedAttendanceSecuritySettings AttendanceSecuritySetting[]   @relation("AttendanceSecuritySettingUpdatedBy")
-  enrolledEmployeeFaces             EmployeeFaceEnrollment[]      @relation("EmployeeFaceEnrollmentEnrolledBy")
-  revokedEmployeeFaces              EmployeeFaceEnrollment[]      @relation("EmployeeFaceEnrollmentRevokedBy")
-  createdNotifications              Notification[]               @relation("NotificationActor")
-  userNotifications                 UserNotification[]
+  supervisedEmployees                Employee[]                        @relation("EmployeeSupervisorUser")
+  draftedViolations                  EmployeeViolation[]               @relation("EmployeeViolationDraftedBy")
+  reviewedViolations                 EmployeeViolation[]               @relation("EmployeeViolationReviewedBy")
+  createdViolationResets             EmployeeViolationReset[]          @relation("EmployeeViolationResetCreatedBy")
+  createdViolationAutoResetPolicies  ViolationAutoResetPolicy[]        @relation("ViolationAutoResetPolicyCreatedBy")
+  createdPayrolls                    Payroll[]                         @relation("PayrollCreatedBy")
+  managerReviewedPayrolls            Payroll[]                         @relation("PayrollManagerReviewedBy")
+  gmReviewedPayrolls                 Payroll[]                         @relation("PayrollGmReviewedBy")
+  releasedPayrolls                   Payroll[]                         @relation("PayrollReleasedBy")
+  createdPayrollEmployees            PayrollEmployee[]                 @relation("PayrollEmployeeCreatedBy")
+  updatedPayrollEmployees            PayrollEmployee[]                 @relation("PayrollEmployeeUpdatedBy")
+  createdPayrollEarnings             PayrollEarning[]                  @relation("PayrollEarningCreatedBy")
+  createdPayrollDeductions           PayrollDeduction[]                @relation("PayrollDeductionCreatedBy")
+  createdContributionBracketVersions ContributionBracketVersion[]      @relation("ContributionBracketVersionCreatedBy")
+  createdPositionRateHistories       PositionRateHistory[]             @relation("PositionRateHistoryCreatedBy")
+  createdEmployeePositionHistories   EmployeePositionHistory[]         @relation("EmployeePositionHistoryCreatedBy")
+  createdDeductionTypes              DeductionType[]                   @relation("DeductionTypeCreatedBy")
+  updatedDeductionTypes              DeductionType[]                   @relation("DeductionTypeUpdatedBy")
+  assignedEmployeeDeductions         EmployeeDeductionAssignment[]     @relation("EmployeeDeductionAssignmentAssignedBy")
+  updatedEmployeeDeductions          EmployeeDeductionAssignment[]     @relation("EmployeeDeductionAssignmentUpdatedBy")
+  reviewedEmployeeDeductions         EmployeeDeductionAssignment[]     @relation("EmployeeDeductionAssignmentReviewedBy")
+  recordedEmployeeDeductionPayments  EmployeeDeductionPayment[]        @relation("EmployeeDeductionPaymentCreatedBy")
+  reviewedCashAdvanceRequests        CashAdvanceRequest[]              @relation("CashAdvanceRequestReviewedBy")
+  reviewedGovernmentLoanRequests     GovernmentLoanAssistanceRequest[] @relation("GovernmentLoanAssistanceRequestReviewedBy")
+  reviewedSilEncashmentRequests      SilEncashmentRequest[]            @relation("SilEncashmentRequestReviewedBy")
+  reviewedLeaveRequests              LeaveRequest[]                    @relation("LeaveRequestReviewedBy")
+  reviewedDayOffRequests             DayOffRequest[]                   @relation("DayOffRequestReviewedBy")
+  reviewedScheduleChangeRequests     ScheduleChangeRequest[]           @relation("ScheduleChangeRequestReviewedBy")
+  reviewedScheduleSwapRequests       ScheduleSwapRequest[]             @relation("ScheduleSwapRequestReviewedBy")
+  createdAiScheduleDrafts            AiScheduleDraft[]                 @relation("AiScheduleDraftCreatedBy")
+  approvedAiScheduleDrafts           AiScheduleDraft[]                 @relation("AiScheduleDraftApprovedBy")
+  acknowledgedAiScheduleDrafts       AiScheduleDraft[]                 @relation("AiScheduleDraftWarningsAcknowledgedBy")
+  aiActionAuditEntries               AiActionAudit[]                   @relation("AiActionAuditActor")
+  aiConversations                    AiConversation[]
+  createdScheduleCoverageRules       ScheduleCoverageRule[]            @relation("ScheduleCoverageRuleCreatedBy")
+  initiatedLeaveCreditResetRuns      LeaveCreditResetRun[]             @relation("LeaveCreditResetRunInitiatedBy")
+  createdLeaveCreditLedgerEntries    EmployeeLeaveCreditLedger[]       @relation("EmployeeLeaveCreditLedgerCreatedBy")
+  updatedAttendanceSecuritySettings  AttendanceSecuritySetting[]       @relation("AttendanceSecuritySettingUpdatedBy")
+  enrolledEmployeeFaces              EmployeeFaceEnrollment[]          @relation("EmployeeFaceEnrollmentEnrolledBy")
+  revokedEmployeeFaces               EmployeeFaceEnrollment[]          @relation("EmployeeFaceEnrollmentRevokedBy")
+  createdNotifications               Notification[]                    @relation("NotificationActor")
+  userNotifications                  UserNotification[]
 
   @@index([createdAt])
   @@index([role, username])
@@ -68,21 +74,23 @@ model User {
 }
 
 model Notification {
-  id            String               @id @default(cuid())
+  id            String                @id @default(cuid())
+  dedupeKey     String?               @unique
   eventType     NotificationEventType
   module        NotificationModule
   title         String
   message       String
-  severity      NotificationSeverity @default(INFO)
+  severity      NotificationSeverity  @default(INFO)
   actorUserId   String?
   entityType    String?
   entityId      String?
   linkHref      String
   metadata      Json?
-  emailEligible Boolean              @default(false)
-  createdAt     DateTime             @default(now())
-  actor         User?                @relation("NotificationActor", fields: [actorUserId], references: [userId], onDelete: SetNull)
+  emailEligible Boolean               @default(false)
+  createdAt     DateTime              @default(now())
+  actor         User?                 @relation("NotificationActor", fields: [actorUserId], references: [userId], onDelete: SetNull)
   recipients    UserNotification[]
+  schedulePublicationOutbox SchedulePublicationOutbox?
 
   @@index([module, createdAt])
   @@index([eventType, createdAt])
@@ -155,28 +163,29 @@ model Employee {
   positionHistory              EmployeePositionHistory[]
 
   // Scheduling links
-  weeklySchedules              WeeklySchedule[]
-  shiftOverrides               EmployeeShiftOverride[]
-  attendances                  Attendance[]
-  punches                      Punch[]
-  faceEnrollments              EmployeeFaceEnrollment[]
-  faceVerificationAttempts     FaceVerificationAttempt[]
-  attendanceFaceChallenges     AttendanceFaceChallenge[]
-  attendanceQrRedemptions      AttendanceQrRedemption[]
-  employeeViolations           EmployeeViolation[]
-  violationResets              EmployeeViolationReset[]
-  violationAutoResetPolicies   ViolationAutoResetPolicy[]
-  payrollEmployees             PayrollEmployee[]
-  deductionAssignments         EmployeeDeductionAssignment[]
-  cashAdvanceRequests          CashAdvanceRequest[]
+  weeklySchedules                  WeeklySchedule[]
+  shiftOverrides                   EmployeeShiftOverride[]
+  attendances                      Attendance[]
+  punches                          Punch[]
+  faceEnrollments                  EmployeeFaceEnrollment[]
+  faceVerificationAttempts         FaceVerificationAttempt[]
+  attendanceFaceChallenges         AttendanceFaceChallenge[]
+  attendanceQrRedemptions          AttendanceQrRedemption[]
+  employeeViolations               EmployeeViolation[]
+  violationResets                  EmployeeViolationReset[]
+  violationAutoResetPolicies       ViolationAutoResetPolicy[]
+  payrollEmployees                 PayrollEmployee[]
+  deductionAssignments             EmployeeDeductionAssignment[]
+  cashAdvanceRequests              CashAdvanceRequest[]
   governmentLoanAssistanceRequests GovernmentLoanAssistanceRequest[]
-  silEncashmentRequests        SilEncashmentRequest[]
-  leaveRequests                LeaveRequest[]
-  leaveCreditLedgerEntries     EmployeeLeaveCreditLedger[]
-  dayOffRequests               DayOffRequest[]
-  scheduleChangeRequests       ScheduleChangeRequest[]
-  scheduleSwapRequestsMade     ScheduleSwapRequest[]         @relation("ScheduleSwapRequestRequester")
-  scheduleSwapRequestsReceived ScheduleSwapRequest[]         @relation("ScheduleSwapRequestCoworker")
+  silEncashmentRequests            SilEncashmentRequest[]
+  leaveRequests                    LeaveRequest[]
+  leaveCreditLedgerEntries         EmployeeLeaveCreditLedger[]
+  dayOffRequests                   DayOffRequest[]
+  scheduleChangeRequests           ScheduleChangeRequest[]
+  scheduleSwapRequestsMade         ScheduleSwapRequest[]             @relation("ScheduleSwapRequestRequester")
+  scheduleSwapRequestsReceived     ScheduleSwapRequest[]             @relation("ScheduleSwapRequestCoworker")
+  aiScheduleDraftAssignments       AiScheduleDraftAssignment[]
 
   @@index([isArchived, employeeCode])
   @@index([departmentId])
@@ -187,15 +196,16 @@ model Employee {
 
 /// Department catalog (simple name/description, soft active flag).
 model Department {
-  departmentId    String                    @id @default(cuid())
-  name            String                    @unique
-  description     String?
-  isActive        Boolean                   @default(true)
-  createdAt       DateTime                  @default(now())
-  updatedAt       DateTime                  @updatedAt
-  positions       Position[]
-  employees       Employee[]
-  positionHistory EmployeePositionHistory[]
+  departmentId          String                    @id @default(cuid())
+  name                  String                    @unique
+  description           String?
+  isActive              Boolean                   @default(true)
+  createdAt             DateTime                  @default(now())
+  updatedAt             DateTime                  @updatedAt
+  positions             Position[]
+  employees             Employee[]
+  positionHistory       EmployeePositionHistory[]
+  scheduleCoverageRules ScheduleCoverageRule[]
 
   @@index([isActive, name])
 }
@@ -214,10 +224,11 @@ model Position {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  department      Department                @relation(fields: [departmentId], references: [departmentId])
-  employees       Employee[]
-  positionHistory EmployeePositionHistory[]
-  rateHistory     PositionRateHistory[]
+  department            Department                @relation(fields: [departmentId], references: [departmentId])
+  employees             Employee[]
+  positionHistory       EmployeePositionHistory[]
+  rateHistory           PositionRateHistory[]
+  scheduleCoverageRules ScheduleCoverageRule[]
 
   @@unique([name, departmentId])
   @@index([isActive, departmentId, name])
@@ -359,9 +370,13 @@ model Shift {
   weeklySchedulesSat WeeklySchedule[] @relation("ws_sat")
 
   // Usage
-  overrides              EmployeeShiftOverride[]
-  attendances            Attendance[]            @relation("attendance_expected_shift")
-  scheduleChangeRequests ScheduleChangeRequest[]
+  overrides                          EmployeeShiftOverride[]
+  aiScheduleDraftAssignments         AiScheduleDraftAssignment[] @relation("AiScheduleDraftAssignmentShift")
+  aiScheduleDraftBaselineAssignments AiScheduleDraftAssignment[] @relation("AiScheduleDraftAssignmentBaselineShift")
+  aiScheduleDraftOverrideBaselines   AiScheduleDraftAssignment[] @relation("AiScheduleDraftAssignmentOverrideShift")
+  attendances                        Attendance[]                @relation("attendance_expected_shift")
+  scheduleChangeRequests             ScheduleChangeRequest[]
+  scheduleCoverageRules              ScheduleCoverageRule[]
 
   @@index([name])
 }
@@ -410,6 +425,178 @@ model EmployeeShiftOverride {
 
   @@unique([employeeId, workDate])
   @@index([workDate])
+}
+
+/// Manager-configured minimum staffing rules. No rules are seeded by default.
+model ScheduleCoverageRule {
+  id              String                       @id @default(cuid())
+  name            String
+  departmentId    String?
+  positionId      String?
+  shiftId         Int?
+  weekday         Int // ISO weekday: Monday=1 ... Sunday=7
+  minimumStaff    Int
+  maximumStaff    Int?
+  priority        ScheduleCoverageRulePriority @default(HARD)
+  isActive        Boolean                      @default(true)
+  effectiveFrom   DateTime?
+  effectiveTo     DateTime?
+  createdByUserId String
+  createdAt       DateTime                     @default(now())
+  updatedAt       DateTime                     @updatedAt
+
+  department Department? @relation(fields: [departmentId], references: [departmentId], onDelete: Restrict)
+  position   Position?   @relation(fields: [positionId], references: [positionId], onDelete: Restrict)
+  shift      Shift?      @relation(fields: [shiftId], references: [id], onDelete: Restrict)
+  createdBy  User        @relation("ScheduleCoverageRuleCreatedBy", fields: [createdByUserId], references: [userId], onDelete: Restrict)
+
+  @@index([isActive, weekday, departmentId, positionId, shiftId])
+  @@index([effectiveFrom, effectiveTo])
+}
+
+/// Manager-owned, versioned proposal. Draft records never update live schedules.
+model AiScheduleDraft {
+  id                   String                @id @default(cuid())
+  lineageId            String
+  version              Int
+  requestKey           String?               @unique
+  weekStart            DateTime
+  scope                Json
+  scopeKey             String
+  sourceMode           AiScheduleDraftSource
+  sourceWeekStart      DateTime?
+  status               AiScheduleDraftStatus @default(DRAFT)
+  createdByUserId      String
+  sourceFingerprint    String
+  draftFingerprint     String
+  validatedFingerprint String?
+  validatedSourceFingerprint String?
+  validationReport     Json?
+  warningsAcknowledgedAt DateTime?
+  warningsAcknowledgedByUserId String?
+  approvedByUserId     String?
+  approvedAt           DateTime?
+  publishedAt          DateTime?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  createdBy     User                        @relation("AiScheduleDraftCreatedBy", fields: [createdByUserId], references: [userId], onDelete: Restrict)
+  approvedBy    User?                       @relation("AiScheduleDraftApprovedBy", fields: [approvedByUserId], references: [userId], onDelete: SetNull)
+  warningsAcknowledgedBy User?              @relation("AiScheduleDraftWarningsAcknowledgedBy", fields: [warningsAcknowledgedByUserId], references: [userId], onDelete: SetNull)
+  assignments   AiScheduleDraftAssignment[]
+  auditEntries  AiActionAudit[]
+  conversations AiConversation[]            @relation("AiConversationActiveDraft")
+  publicationOutbox SchedulePublicationOutbox?
+
+  @@unique([lineageId, version])
+  @@index([createdByUserId, weekStart, scopeKey, updatedAt])
+  @@index([weekStart, status])
+}
+
+/// One candidate assignment for each employee and date in a draft version.
+model AiScheduleDraftAssignment {
+  id                      String                     @id @default(cuid())
+  draftId                 String
+  employeeId              String
+  workDate                DateTime
+  shiftId                 Int?
+  baselineShiftId         Int?
+  baselineOverrideShiftId Int?
+  hasBaselineOverride     Boolean                    @default(false)
+  assignmentKind          AiScheduleAssignmentKind
+  isProtected             Boolean                    @default(false)
+  source                  AiScheduleAssignmentSource
+  reason                  String?
+  createdAt               DateTime                   @default(now())
+
+  draft                 AiScheduleDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  employee              Employee        @relation(fields: [employeeId], references: [employeeId], onDelete: Restrict)
+  shift                 Shift?          @relation("AiScheduleDraftAssignmentShift", fields: [shiftId], references: [id], onDelete: Restrict)
+  baselineShift         Shift?          @relation("AiScheduleDraftAssignmentBaselineShift", fields: [baselineShiftId], references: [id], onDelete: SetNull)
+  baselineOverrideShift Shift?          @relation("AiScheduleDraftAssignmentOverrideShift", fields: [baselineOverrideShiftId], references: [id], onDelete: SetNull)
+
+  @@unique([draftId, employeeId, workDate])
+  @@index([employeeId, workDate])
+}
+
+/// Append-only record of draft operations. No update or delete action is exposed.
+model AiActionAudit {
+  id             String   @id @default(cuid())
+  actorUserId    String
+  action         String
+  draftId        String?
+  conversationId String?
+  outcome        String
+  metadata       Json     @default("{}")
+  createdAt      DateTime @default(now())
+
+  actor        User             @relation("AiActionAuditActor", fields: [actorUserId], references: [userId], onDelete: Restrict)
+  draft        AiScheduleDraft? @relation(fields: [draftId], references: [id], onDelete: SetNull)
+  conversation AiConversation?  @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+
+  @@index([draftId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@index([conversationId, createdAt])
+}
+
+/// Durable, idempotent delivery record created in the same transaction as publication.
+model SchedulePublicationOutbox {
+  id               String                               @id @default(cuid())
+  draftId          String                               @unique
+  recipientUserIds Json
+  notificationId   String?                              @unique
+  status           SchedulePublicationNotificationStatus @default(PENDING)
+  attempts         Int                                  @default(0)
+  lastError        String?
+  deliveredAt      DateTime?
+  createdAt        DateTime                             @default(now())
+  updatedAt        DateTime                             @updatedAt
+
+  draft        AiScheduleDraft @relation(fields: [draftId], references: [id], onDelete: Restrict)
+  notification Notification?   @relation(fields: [notificationId], references: [id], onDelete: SetNull)
+
+  @@index([status, updatedAt])
+}
+
+/// Manager-owned scheduling chat. Messages contain only bounded prompts and tool results.
+model AiConversation {
+  id                       String              @id @default(cuid())
+  userId                   String
+  topic                    AiConversationTopic @default(SCHEDULING)
+  activeDraftId            String?
+  /// Owner-scoped structured clarification or scheduling proposal. Maps existing column; no database migration needed.
+  pendingInteraction      Json?               @map("pendingEmployeeSelection")
+  createdAt                DateTime            @default(now())
+  updatedAt                DateTime            @updatedAt
+
+  user         User             @relation(fields: [userId], references: [userId], onDelete: Restrict)
+  activeDraft  AiScheduleDraft? @relation("AiConversationActiveDraft", fields: [activeDraftId], references: [id], onDelete: SetNull)
+  messages     AiMessage[]
+  auditEntries AiActionAudit[]
+
+  @@index([userId, updatedAt])
+  @@index([userId, createdAt])
+  @@index([activeDraftId])
+}
+
+/// Ordered, owner-scoped transcript. Tool call arguments/results are persisted for replay safety.
+model AiMessage {
+  id                String        @id @default(cuid())
+  conversationId    String
+  sequence          Int
+  role              AiMessageRole
+  content           String        @db.Text
+  toolName          String?
+  toolCallId        String?
+  requestKey        String?       @unique
+  replyToRequestKey String?       @unique
+  createdAt         DateTime      @default(now())
+
+  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, sequence])
+  @@index([conversationId, createdAt])
+  @@index([conversationId, role, createdAt])
 }
 
 /// Daily attendance snapshot; expected times come from pattern/override.
@@ -498,29 +685,29 @@ model Punch {
 }
 
 model AttendanceSecuritySetting {
-  id                     String   @id @default("default")
-  gpsValidationEnabled   Boolean  @default(false)
-  attendancePunchMode    String   @default("QR_ONLY")
-  faceRecognitionEnabled Boolean  @default(false)
-  faceRequiredForQrPunch Boolean  @default(false)
-  faceLivenessRequired   Boolean  @default(false)
-  faceMatchMaxDistance   Decimal  @default(0.35) @db.Decimal(4, 2)
-  faceFailureMode        String   @default("BLOCK")
-  activeFaceChallengeRequired       Boolean @default(true)
-  identityContinuityRequired        Boolean @default(true)
-  passiveAntiSpoofRequired          Boolean @default(false)
-  faceChallengeExpiresSeconds       Int     @default(20)
-  faceChallengeActionCount          Int     @default(2)
-  faceChallengeMaxFrames            Int     @default(24)
-  faceChallengeMaxPayloadBytes      Int     @default(1250000)
-  faceChallengeMaxAttemptsPerMinute Int     @default(5)
-  faceChallengeMaxFailures          Int     @default(3)
-  faceChallengeCooldownSeconds      Int     @default(60)
-  faceContinuityFrameCount          Int     @default(5)
-  faceContinuityMaxDistance         Decimal @default(0.35) @db.Decimal(4, 2)
-  updatedByUserId        String?
-  createdAt              DateTime @default(now())
-  updatedAt              DateTime @updatedAt
+  id                                String   @id @default("default")
+  gpsValidationEnabled              Boolean  @default(false)
+  attendancePunchMode               String   @default("QR_ONLY")
+  faceRecognitionEnabled            Boolean  @default(false)
+  faceRequiredForQrPunch            Boolean  @default(false)
+  faceLivenessRequired              Boolean  @default(false)
+  faceMatchMaxDistance              Decimal  @default(0.35) @db.Decimal(4, 2)
+  faceFailureMode                   String   @default("BLOCK")
+  activeFaceChallengeRequired       Boolean  @default(true)
+  identityContinuityRequired        Boolean  @default(true)
+  passiveAntiSpoofRequired          Boolean  @default(false)
+  faceChallengeExpiresSeconds       Int      @default(20)
+  faceChallengeActionCount          Int      @default(2)
+  faceChallengeMaxFrames            Int      @default(24)
+  faceChallengeMaxPayloadBytes      Int      @default(1250000)
+  faceChallengeMaxAttemptsPerMinute Int      @default(5)
+  faceChallengeMaxFailures          Int      @default(3)
+  faceChallengeCooldownSeconds      Int      @default(60)
+  faceContinuityFrameCount          Int      @default(5)
+  faceContinuityMaxDistance         Decimal  @default(0.35) @db.Decimal(4, 2)
+  updatedByUserId                   String?
+  createdAt                         DateTime @default(now())
+  updatedAt                         DateTime @updatedAt
 
   updatedBy User? @relation("AttendanceSecuritySettingUpdatedBy", fields: [updatedByUserId], references: [userId], onDelete: SetNull)
 
@@ -573,9 +760,9 @@ model FaceVerificationAttempt {
   details          Json?
   createdAt        DateTime    @default(now())
 
-  employee   Employee    @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
-  attendance Attendance? @relation(fields: [attendanceId], references: [id], onDelete: SetNull)
-  punch      Punch?      @relation(fields: [punchId], references: [id], onDelete: SetNull)
+  employee   Employee                 @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  attendance Attendance?              @relation(fields: [attendanceId], references: [id], onDelete: SetNull)
+  punch      Punch?                   @relation(fields: [punchId], references: [id], onDelete: SetNull)
   challenge  AttendanceFaceChallenge? @relation(fields: [challengeId], references: [id], onDelete: SetNull)
 
   @@index([employeeId, createdAt])
@@ -587,27 +774,27 @@ model FaceVerificationAttempt {
 }
 
 model AttendanceFaceChallenge {
-  id                    String                        @id @default(cuid())
-  employeeId            String
-  punchId               String?                       @unique
-  kioskId               String
-  kioskBindingHash      String
-  nonceHash             String
-  actions               Json
-  expectedPunchType     PUNCH_TYPE
-  status                AttendanceFaceChallengeStatus @default(PENDING)
-  expiresAt             DateTime
-  processingStartedAt   DateTime?
-  usedAt                DateTime?
-  failureReason         String?
-  frameSequenceHash     String?                       @unique
-  details               Json?
-  createdAt             DateTime                      @default(now())
-  updatedAt             DateTime                      @updatedAt
+  id                  String                        @id @default(cuid())
+  employeeId          String
+  punchId             String?                       @unique
+  kioskId             String
+  kioskBindingHash    String
+  nonceHash           String
+  actions             Json
+  expectedPunchType   PUNCH_TYPE
+  status              AttendanceFaceChallengeStatus @default(PENDING)
+  expiresAt           DateTime
+  processingStartedAt DateTime?
+  usedAt              DateTime?
+  failureReason       String?
+  frameSequenceHash   String?                       @unique
+  details             Json?
+  createdAt           DateTime                      @default(now())
+  updatedAt           DateTime                      @updatedAt
 
-  employee              Employee                      @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
-  punch                 Punch?                        @relation(fields: [punchId], references: [id], onDelete: SetNull)
-  qrRedemption          AttendanceQrRedemption?
+  employee             Employee                  @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  punch                Punch?                    @relation(fields: [punchId], references: [id], onDelete: SetNull)
+  qrRedemption         AttendanceQrRedemption?
   verificationAttempts FaceVerificationAttempt[]
 
   @@index([employeeId, status, createdAt])
@@ -616,18 +803,18 @@ model AttendanceFaceChallenge {
 }
 
 model AttendanceQrRedemption {
-  tokenHash          String   @id
-  employeeId         String
-  challengeId        String?  @unique
-  punchId            String?  @unique
-  kioskBindingHash   String
-  expiresAt          DateTime
-  usedAt             DateTime?
-  createdAt          DateTime @default(now())
+  tokenHash        String    @id
+  employeeId       String
+  challengeId      String?   @unique
+  punchId          String?   @unique
+  kioskBindingHash String
+  expiresAt        DateTime
+  usedAt           DateTime?
+  createdAt        DateTime  @default(now())
 
-  employee           Employee                 @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
-  challenge          AttendanceFaceChallenge? @relation(fields: [challengeId], references: [id], onDelete: SetNull)
-  punch              Punch?                   @relation(fields: [punchId], references: [id], onDelete: SetNull)
+  employee  Employee                 @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  challenge AttendanceFaceChallenge? @relation(fields: [challengeId], references: [id], onDelete: SetNull)
+  punch     Punch?                   @relation(fields: [punchId], references: [id], onDelete: SetNull)
 
   @@index([employeeId, createdAt])
   @@index([kioskBindingHash, createdAt])
@@ -651,28 +838,28 @@ model AttendanceContextLog {
 }
 
 model EmployeeViolation {
-  id                   String                  @id @default(cuid())
-  employeeId           String
-  violationId          String
-  violationDate        DateTime
-  strikePointsSnapshot Int                     @default(1)
-  status               EmployeeViolationStatus @default(DRAFT)
-  draftedById          String?
-  submittedAt          DateTime?
-  reviewedById         String?
-  reviewedAt           DateTime?
-  reviewRemarks        String?
-  isAcknowledged       Boolean                 @default(false)
-  acknowledgedAt       DateTime?
+  id                              String                  @id @default(cuid())
+  employeeId                      String
+  violationId                     String
+  violationDate                   DateTime
+  strikePointsSnapshot            Int                     @default(1)
+  status                          EmployeeViolationStatus @default(DRAFT)
+  draftedById                     String?
+  submittedAt                     DateTime?
+  reviewedById                    String?
+  reviewedAt                      DateTime?
+  reviewRemarks                   String?
+  isAcknowledged                  Boolean                 @default(false)
+  acknowledgedAt                  DateTime?
   appealPaperSecuredAt            DateTime?
   appealPaperFilledAt             DateTime?
   appealPaperSubmittedToManagerAt DateTime?
   appealSubmittedAt               DateTime?
-  remarks              String?
-  isCountedForStrike   Boolean                 @default(true)
-  voidedAt             DateTime?
-  voidReason           String?
-  createdAt            DateTime                @default(now())
+  remarks                         String?
+  isCountedForStrike              Boolean                 @default(true)
+  voidedAt                        DateTime?
+  voidReason                      String?
+  createdAt                       DateTime                @default(now())
 
   violation  Violation @relation(fields: [violationId], references: [violationId], onDelete: Cascade)
   employee   Employee  @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
@@ -807,15 +994,15 @@ model EmployeeDeductionAssignment {
   createdAt             DateTime                          @default(now())
   updatedAt             DateTime                          @updatedAt
 
-  employee           Employee                   @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
-  deductionType      DeductionType              @relation(fields: [deductionTypeId], references: [id], onDelete: Restrict)
-  payrollDeductions  PayrollDeduction[]
-  payments           EmployeeDeductionPayment[]
-  cashAdvanceRequest CashAdvanceRequest?
+  employee                        Employee                         @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  deductionType                   DeductionType                    @relation(fields: [deductionTypeId], references: [id], onDelete: Restrict)
+  payrollDeductions               PayrollDeduction[]
+  payments                        EmployeeDeductionPayment[]
+  cashAdvanceRequest              CashAdvanceRequest?
   governmentLoanAssistanceRequest GovernmentLoanAssistanceRequest?
-  assignedBy         User?                      @relation("EmployeeDeductionAssignmentAssignedBy", fields: [assignedByUserId], references: [userId], onDelete: SetNull)
-  updatedBy          User?                      @relation("EmployeeDeductionAssignmentUpdatedBy", fields: [updatedByUserId], references: [userId], onDelete: SetNull)
-  reviewedBy         User?                      @relation("EmployeeDeductionAssignmentReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
+  assignedBy                      User?                            @relation("EmployeeDeductionAssignmentAssignedBy", fields: [assignedByUserId], references: [userId], onDelete: SetNull)
+  updatedBy                       User?                            @relation("EmployeeDeductionAssignmentUpdatedBy", fields: [updatedByUserId], references: [userId], onDelete: SetNull)
+  reviewedBy                      User?                            @relation("EmployeeDeductionAssignmentReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
 
   @@unique([employeeId, deductionTypeId, effectiveFrom])
   @@index([employeeId, status, effectiveFrom])
@@ -825,24 +1012,24 @@ model EmployeeDeductionAssignment {
 }
 
 model CashAdvanceRequest {
-  id                    String                   @id @default(cuid())
-  employeeId            String
-  amount                Decimal                  @db.Decimal(12, 2)
-  repaymentPerPayroll   Decimal                  @db.Decimal(12, 2)
-  preferredStartDate    DateTime
-  approvedAmount        Decimal?                 @db.Decimal(12, 2)
-  approvedDeductionMode CashAdvanceDeductionMode?
-  approvedRepaymentPerPayroll Decimal?           @db.Decimal(12, 2)
-  approvedEffectiveFrom DateTime?
-  reason                String?
-  status                CashAdvanceRequestStatus @default(PENDING_MANAGER)
-  managerRemarks        String?
-  submittedAt           DateTime                 @default(now())
-  reviewedByUserId      String?
-  reviewedAt            DateTime?
-  deductionAssignmentId String?                  @unique
-  createdAt             DateTime                 @default(now())
-  updatedAt             DateTime                 @updatedAt
+  id                          String                    @id @default(cuid())
+  employeeId                  String
+  amount                      Decimal                   @db.Decimal(12, 2)
+  repaymentPerPayroll         Decimal                   @db.Decimal(12, 2)
+  preferredStartDate          DateTime
+  approvedAmount              Decimal?                  @db.Decimal(12, 2)
+  approvedDeductionMode       CashAdvanceDeductionMode?
+  approvedRepaymentPerPayroll Decimal?                  @db.Decimal(12, 2)
+  approvedEffectiveFrom       DateTime?
+  reason                      String?
+  status                      CashAdvanceRequestStatus  @default(PENDING_MANAGER)
+  managerRemarks              String?
+  submittedAt                 DateTime                  @default(now())
+  reviewedByUserId            String?
+  reviewedAt                  DateTime?
+  deductionAssignmentId       String?                   @unique
+  createdAt                   DateTime                  @default(now())
+  updatedAt                   DateTime                  @updatedAt
 
   employee            Employee                     @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
   reviewedBy          User?                        @relation("CashAdvanceRequestReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
@@ -854,30 +1041,30 @@ model CashAdvanceRequest {
 }
 
 model GovernmentLoanAssistanceRequest {
-  id                          String                                @id @default(cuid())
-  employeeId                  String
-  agency                      GovernmentLoanAgency
-  requestedAmount             Decimal                               @db.Decimal(12, 2)
-  termMonths                  Int
-  estimatedMonthlyDeduction   Decimal                               @db.Decimal(12, 2)
-  estimatedPerPayrollDeduction Decimal                              @db.Decimal(12, 2)
-  governmentIdSnapshot        String
-  monthlySalarySnapshot       Decimal?                              @db.Decimal(12, 2)
-  checklist                   Json?
-  status                      GovernmentLoanAssistanceRequestStatus @default(PENDING_MANAGER_REVIEW)
-  employeeRemarks             String?
-  managerRemarks              String?
-  agencyRemarks               String?
-  approvedAmount              Decimal?                              @db.Decimal(12, 2)
-  approvedMonthlyPayment      Decimal?                              @db.Decimal(12, 2)
-  repaymentStartDate          DateTime?
-  submittedAt                 DateTime                              @default(now())
-  reviewedByUserId            String?
-  reviewedAt                  DateTime?
-  finalizedAt                 DateTime?
-  deductionAssignmentId       String?                               @unique
-  createdAt                   DateTime                              @default(now())
-  updatedAt                   DateTime                              @updatedAt
+  id                           String                                @id @default(cuid())
+  employeeId                   String
+  agency                       GovernmentLoanAgency
+  requestedAmount              Decimal                               @db.Decimal(12, 2)
+  termMonths                   Int
+  estimatedMonthlyDeduction    Decimal                               @db.Decimal(12, 2)
+  estimatedPerPayrollDeduction Decimal                               @db.Decimal(12, 2)
+  governmentIdSnapshot         String
+  monthlySalarySnapshot        Decimal?                              @db.Decimal(12, 2)
+  checklist                    Json?
+  status                       GovernmentLoanAssistanceRequestStatus @default(PENDING_MANAGER_REVIEW)
+  employeeRemarks              String?
+  managerRemarks               String?
+  agencyRemarks                String?
+  approvedAmount               Decimal?                              @db.Decimal(12, 2)
+  approvedMonthlyPayment       Decimal?                              @db.Decimal(12, 2)
+  repaymentStartDate           DateTime?
+  submittedAt                  DateTime                              @default(now())
+  reviewedByUserId             String?
+  reviewedAt                   DateTime?
+  finalizedAt                  DateTime?
+  deductionAssignmentId        String?                               @unique
+  createdAt                    DateTime                              @default(now())
+  updatedAt                    DateTime                              @updatedAt
 
   employee            Employee                     @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
   reviewedBy          User?                        @relation("GovernmentLoanAssistanceRequestReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
@@ -903,8 +1090,8 @@ model SilEncashmentRequest {
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
 
-  employee    Employee @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
-  reviewedBy  User?    @relation("SilEncashmentRequestReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
+  employee    Employee                   @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  reviewedBy  User?                      @relation("SilEncashmentRequestReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
   ledgerEntry EmployeeLeaveCreditLedger? @relation(fields: [ledgerEntryId], references: [id], onDelete: SetNull)
 
   @@index([employeeId, status, submittedAt])
@@ -927,9 +1114,9 @@ model LeaveRequest {
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
 
-  employee    Employee     @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
-  reviewedBy  User?        @relation("LeaveRequestReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
-  attendances Attendance[]
+  employee            Employee                    @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  reviewedBy          User?                       @relation("LeaveRequestReviewedBy", fields: [reviewedByUserId], references: [userId], onDelete: SetNull)
+  attendances         Attendance[]
   creditLedgerEntries EmployeeLeaveCreditLedger[]
 
   @@index([employeeId, status, submittedAt])
@@ -952,21 +1139,21 @@ model LeaveCreditPolicy {
 }
 
 model LeaveCreditResetRun {
-  id             String                  @id @default(cuid())
-  policyId       String
-  leaveType      LeaveCreditType
-  cycleStartDate DateTime
-  cycleEndDate   DateTime
-  effectiveDate  DateTime
-  annualCredits  Int
-  employeeCount  Int                     @default(0)
-  runType        LeaveCreditResetRunType @default(MANUAL)
-  notes          String?
+  id                String                  @id @default(cuid())
+  policyId          String
+  leaveType         LeaveCreditType
+  cycleStartDate    DateTime
+  cycleEndDate      DateTime
+  effectiveDate     DateTime
+  annualCredits     Int
+  employeeCount     Int                     @default(0)
+  runType           LeaveCreditResetRunType @default(MANUAL)
+  notes             String?
   initiatedByUserId String?
-  createdAt      DateTime                @default(now())
+  createdAt         DateTime                @default(now())
 
-  policy        LeaveCreditPolicy          @relation(fields: [policyId], references: [id], onDelete: Cascade)
-  initiatedBy   User?                      @relation("LeaveCreditResetRunInitiatedBy", fields: [initiatedByUserId], references: [userId], onDelete: SetNull)
+  policy        LeaveCreditPolicy           @relation(fields: [policyId], references: [id], onDelete: Cascade)
+  initiatedBy   User?                       @relation("LeaveCreditResetRunInitiatedBy", fields: [initiatedByUserId], references: [userId], onDelete: SetNull)
   ledgerEntries EmployeeLeaveCreditLedger[]
 
   @@index([leaveType, effectiveDate])
@@ -974,25 +1161,25 @@ model LeaveCreditResetRun {
 }
 
 model EmployeeLeaveCreditLedger {
-  id                String                     @id @default(cuid())
-  employeeId        String
-  leaveType         LeaveCreditType
-  entryType         LeaveCreditLedgerEntryType
-  amount            Int
-  balanceBefore     Int
-  balanceAfter      Int
-  effectiveDate     DateTime
-  cycleStartDate    DateTime
-  leaveRequestId    String?
-  resetRunId        String?
-  notes             String?
-  createdByUserId   String?
-  createdAt         DateTime                   @default(now())
+  id              String                     @id @default(cuid())
+  employeeId      String
+  leaveType       LeaveCreditType
+  entryType       LeaveCreditLedgerEntryType
+  amount          Int
+  balanceBefore   Int
+  balanceAfter    Int
+  effectiveDate   DateTime
+  cycleStartDate  DateTime
+  leaveRequestId  String?
+  resetRunId      String?
+  notes           String?
+  createdByUserId String?
+  createdAt       DateTime                   @default(now())
 
-  employee      Employee            @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
-  leaveRequest  LeaveRequest?        @relation(fields: [leaveRequestId], references: [id], onDelete: SetNull)
-  resetRun      LeaveCreditResetRun? @relation(fields: [resetRunId], references: [id], onDelete: SetNull)
-  createdBy     User?                @relation("EmployeeLeaveCreditLedgerCreatedBy", fields: [createdByUserId], references: [userId], onDelete: SetNull)
+  employee             Employee              @relation(fields: [employeeId], references: [employeeId], onDelete: Cascade)
+  leaveRequest         LeaveRequest?         @relation(fields: [leaveRequestId], references: [id], onDelete: SetNull)
+  resetRun             LeaveCreditResetRun?  @relation(fields: [resetRunId], references: [id], onDelete: SetNull)
+  createdBy            User?                 @relation("EmployeeLeaveCreditLedgerCreatedBy", fields: [createdByUserId], references: [userId], onDelete: SetNull)
   silEncashmentRequest SilEncashmentRequest?
 
   @@index([employeeId, leaveType, cycleStartDate, createdAt])
@@ -1525,6 +1712,59 @@ enum AttendanceFaceChallengeStatus {
   PASSED
   FAILED
   EXPIRED
+}
+
+enum AiScheduleDraftStatus {
+  DRAFT
+  VALIDATED
+  APPROVED
+  PUBLISHED
+  DISCARDED
+}
+
+enum SchedulePublicationNotificationStatus {
+  PENDING
+  PROCESSING
+  DELIVERED
+  FAILED
+  SKIPPED
+}
+
+enum AiScheduleDraftSource {
+  CURRENT_SCHEDULE
+  REFERENCE_WEEK
+  EMPTY
+}
+
+enum AiScheduleAssignmentKind {
+  WORK
+  DAY_OFF
+  UNASSIGNED
+  PROTECTED_LEAVE
+}
+
+enum AiScheduleAssignmentSource {
+  CURRENT_SCHEDULE
+  REFERENCE_WEEK
+  EMPTY
+  MANUAL
+  GENERATOR
+  AI
+}
+
+enum AiConversationTopic {
+  SCHEDULING
+}
+
+enum AiMessageRole {
+  USER
+  ASSISTANT
+  TOOL
+}
+
+enum ScheduleCoverageRulePriority {
+  HARD
+  SOFT
 }
 
 enum GENDER {
