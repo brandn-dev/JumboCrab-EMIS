@@ -21,8 +21,7 @@ import { Input } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast-provider";
 import {
   FaceCaptureClientError,
-  captureFaceChallengeFrames,
-  type BrowserFaceChallengeAction,
+  captureFrontFaceFrames,
 } from "@/lib/face-capture-client";
 
 type AttendancePunchMode =
@@ -50,13 +49,11 @@ type PrimaryPunchNotice = {
 };
 
 type PendingFacePunch = {
+  employeeId: string;
   employeeName: string;
   employeeCode: string;
   username: string;
   nextPunch: string;
-  attemptId: string;
-  nonce: string;
-  actions: BrowserFaceChallengeAction[];
   faceExpiresAt: number;
 };
 
@@ -94,10 +91,7 @@ const toErrorMessage = (err: unknown, fallback: string) =>
 const cameraUnavailableMessage =
   "Camera unavailable. Use HTTPS or kiosk fallback when camera access is blocked.";
 
-const getBrowserKioskId = () =>
-  typeof window !== "undefined"
-    ? process.env.NEXT_PUBLIC_KIOSK_ID || window.location.hostname
-    : process.env.NEXT_PUBLIC_KIOSK_ID || "KIOSK";
+const FACE_VERIFICATION_WINDOW_MS = 30_000;
 
 const modeLabel = (mode: AttendancePunchMode) => {
   switch (mode) {
@@ -173,9 +167,12 @@ export function KioskPrimaryAttendancePanel({
     setFaceAutoStatus("Starting camera");
   };
 
-  const beginFaceStep = (input: PendingFacePunch) => {
+  const beginFaceStep = (input: Omit<PendingFacePunch, "faceExpiresAt">) => {
     faceAttemptSessionRef.current += 1;
-    setPendingFacePunch(input);
+    setPendingFacePunch({
+      ...input,
+      faceExpiresAt: Date.now() + FACE_VERIFICATION_WINDOW_MS,
+    });
     setStep("FACE");
     setError(null);
     setFaceAutoStatus("Starting camera");
@@ -205,14 +202,13 @@ export function KioskPrimaryAttendancePanel({
 
   const resolveEmployeeQr = useCallback(
     async (token: string) => {
-      const kioskId = getBrowserKioskId();
-      const resolved = await resolveEmployeeAttendanceQr({ token, kioskId });
+      const resolved = await resolveEmployeeAttendanceQr({ token });
       if (!resolved.success || !resolved.data) {
         throw new Error(resolved.error || "Failed to resolve employee QR");
       }
 
       if (mode === "QR_ONLY") {
-        const result = await recordKioskResolvedPunch({ token, kioskId });
+        const result = await recordKioskResolvedPunch({ token });
         if (!result.success || !result.data) {
           throw new Error(result.error || "Failed to record QR punch");
         }
@@ -231,23 +227,12 @@ export function KioskPrimaryAttendancePanel({
         return;
       }
 
-      if (
-        !resolved.data.attemptId ||
-        !resolved.data.nonce ||
-        !resolved.data.expiresAt ||
-        !Array.isArray(resolved.data.actions)
-      ) {
-        throw new Error("Server did not issue a face challenge.");
-      }
       beginFaceStep({
+        employeeId: resolved.data.employeeId,
         employeeName: resolved.data.employeeName,
         employeeCode: resolved.data.employeeCode,
         username: resolved.data.username,
         nextPunch: resolved.data.nextPunch,
-        attemptId: resolved.data.attemptId,
-        nonce: resolved.data.nonce,
-        actions: resolved.data.actions as BrowserFaceChallengeAction[],
-        faceExpiresAt: resolved.data.expiresAt,
       });
     },
     [handlePunchSuccess, mode, toast],
@@ -439,20 +424,16 @@ export function KioskPrimaryAttendancePanel({
       setError(null);
       const result = await getSearchEmployeeFacePreview({
         employeeId: suggestion.employee.employeeId,
-        kioskId: getBrowserKioskId(),
       });
       if (!result.success || !result.data) {
         throw new Error(result.error || "Failed to prepare face verification");
       }
       beginFaceStep({
+        employeeId: result.data.employeeId,
         employeeName: result.data.employeeName,
         employeeCode: result.data.employeeCode,
         username: result.data.username,
         nextPunch: result.data.nextPunch,
-        attemptId: result.data.attemptId,
-        nonce: result.data.nonce,
-        actions: result.data.actions as BrowserFaceChallengeAction[],
-        faceExpiresAt: result.data.expiresAt,
       });
       setSearchTerm(
         `${result.data.employeeCode} - ${result.data.employeeName}`,
@@ -485,24 +466,48 @@ export function KioskPrimaryAttendancePanel({
     try {
       setFaceSubmitting(true);
       setError(null);
-      const facePayload = await captureFaceChallengeFrames(
-        video,
-        pendingFacePunch.actions,
-        setFaceAutoStatus,
-      );
+      setFaceAutoStatus("Face camera directly");
+      const facePayload = await captureFrontFaceFrames(video, {
+        frameCount: 8,
+        delayMs: 150,
+        blinkPrompted: false,
+      });
       if (faceAttemptSessionRef.current !== sessionId) return;
 
       setFaceAutoStatus("Verifying");
       const result = await verifyFaceAndRecordKioskPunch({
-        attemptId: pendingFacePunch.attemptId,
-        nonce: pendingFacePunch.nonce,
-        kioskId: getBrowserKioskId(),
+        employeeId: pendingFacePunch.employeeId,
+        kioskId:
+          typeof window !== "undefined"
+            ? process.env.NEXT_PUBLIC_KIOSK_ID || window.location.hostname
+            : process.env.NEXT_PUBLIC_KIOSK_ID || "KIOSK",
         frames: facePayload.frames,
+        faceCount: facePayload.faceCount,
+        modelVersion: facePayload.modelVersion,
+        faceMetadata: facePayload.metadata,
       });
 
       if (faceAttemptSessionRef.current !== sessionId) return;
 
       if (!result.success || !result.data) {
+        const retryableReasons = new Set([
+          "no_face_detected",
+          "multiple_faces",
+          "face_mismatch",
+          "ambiguous_face_match",
+          "liveness_failed",
+          "missing_face_frames",
+          "face_service_error",
+          "face_service_timeout",
+        ]);
+        if (
+          result.reason &&
+          retryableReasons.has(result.reason) &&
+          faceAttemptSessionRef.current === sessionId
+        ) {
+          setFaceAutoStatus(result.error || "Hold still");
+          return;
+        }
         throw new Error(
           result.error || "Failed to verify face and record punch",
         );
@@ -534,8 +539,6 @@ export function KioskPrimaryAttendancePanel({
       setError(message);
       setFaceAutoStatus(message);
       faceAttemptSessionRef.current += 1;
-      setPendingFacePunch(null);
-      setStep("READY");
       toast.error("Face verification failed.", {
         description: message,
       });
@@ -554,15 +557,26 @@ export function KioskPrimaryAttendancePanel({
       return;
     }
 
+    let stopped = false;
+    let timeoutId: number | null = null;
     const sessionId = faceAttemptSessionRef.current;
-    const timeoutId = window.setTimeout(() => {
-      void submitFaceVerification(sessionId);
-    }, 250);
+
+    const run = async () => {
+      if (stopped || faceAttemptSessionRef.current !== sessionId) return;
+      await submitFaceVerification(sessionId);
+      if (stopped || faceAttemptSessionRef.current !== sessionId) return;
+      timeoutId = window.setTimeout(run, 650);
+    };
+
+    timeoutId = window.setTimeout(run, 250);
 
     return () => {
-      window.clearTimeout(timeoutId);
+      stopped = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
     };
-    // Challenge is single use. Fresh QR/search selection required after any failure.
+    // submitFaceVerification reads current refs/state and controls its own retry status.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [faceCameraReady, faceModelsReady, pendingFacePunch, step]);
 
@@ -721,7 +735,7 @@ export function KioskPrimaryAttendancePanel({
 
             <div className="relative mx-auto max-w-sm overflow-hidden rounded-xl bg-black">
               <div className="pointer-events-none absolute inset-x-3 top-3 z-20 rounded-lg bg-black/75 px-3 py-3 text-center text-xl font-bold tracking-wide text-white">
-                {faceAutoStatus.toUpperCase()}
+                FACE CAMERA DIRECTLY
               </div>
               <video
                 ref={faceVideoRef}

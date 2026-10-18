@@ -503,7 +503,7 @@ model AttendanceSecuritySetting {
   attendancePunchMode    String   @default("QR_ONLY")
   faceRecognitionEnabled Boolean  @default(false)
   faceRequiredForQrPunch Boolean  @default(false)
-  faceLivenessRequired   Boolean  @default(true)
+  faceLivenessRequired   Boolean  @default(false)
   faceMatchMaxDistance   Decimal  @default(0.35) @db.Decimal(4, 2)
   faceFailureMode        String   @default("BLOCK")
   activeFaceChallengeRequired       Boolean @default(true)

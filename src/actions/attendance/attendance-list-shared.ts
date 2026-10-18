@@ -95,6 +95,10 @@ export const loadAttendanceListContext = async ({
   const punchesByEmployeeDay = new Map<string, AttendanceDayPunch[]>();
   if (records.length > 0) {
     const employeeIds = [...new Set(records.map((record) => record.employeeId))];
+    const attendanceWorkDates = new Map(
+      records.map((record) => [record.id, record.workDate]),
+    );
+    const attendanceIds = records.map((record) => record.id);
     const workDates = records.map((record) => record.workDate.getTime());
     const minWorkDate = new Date(Math.min(...workDates));
     const maxWorkDate = new Date(Math.max(...workDates));
@@ -104,13 +108,25 @@ export const loadAttendanceListContext = async ({
     const allPunches = await db.punch.findMany({
       where: {
         employeeId: { in: employeeIds },
-        punchTime: { gte: rangeStart, lt: rangeEnd },
+        OR: [
+          { attendanceId: { in: attendanceIds } },
+          {
+            attendanceId: null,
+            punchTime: { gte: rangeStart, lt: rangeEnd },
+          },
+        ],
       },
       orderBy: { punchTime: "asc" },
     });
 
     allPunches.forEach((punch) => {
-      const key = buildEmployeeDayKey(punch.employeeId, punch.punchTime);
+      const linkedWorkDate = punch.attendanceId
+        ? attendanceWorkDates.get(punch.attendanceId)
+        : null;
+      const key = buildEmployeeDayKey(
+        punch.employeeId,
+        linkedWorkDate ?? punch.punchTime,
+      );
       if (!punchesByEmployeeDay.has(key)) {
         punchesByEmployeeDay.set(key, []);
       }
@@ -325,10 +341,21 @@ export const buildSingleDayAttendanceList = async ({
   });
 
   const employeeIds = employees.map((employee) => employee.employeeId);
+  const attendanceIds = enriched
+    .map((record) => record.id)
+    .filter((id) => !id.startsWith("placeholder-"));
   const punches = await db.punch.findMany({
     where: {
       employeeId: { in: employeeIds },
-      punchTime: { gte: dayStart, lt: dayEnd },
+      OR: [
+        ...(attendanceIds.length
+          ? [{ attendanceId: { in: attendanceIds } }]
+          : []),
+        {
+          attendanceId: null,
+          punchTime: { gte: dayStart, lt: dayEnd },
+        },
+      ],
     },
     orderBy: { punchTime: "asc" },
   });

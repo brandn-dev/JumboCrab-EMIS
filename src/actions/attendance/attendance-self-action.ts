@@ -4,9 +4,12 @@ import { PUNCH_TYPE } from "@prisma/client";
 import { getSession } from "@/lib/auth";
 import { db } from "@/lib/db";
 import {
+  buildExpectedShiftWorkday,
   createPunchAndMaybeRecompute,
   getExpectedShiftForDate,
+  resolveAttendanceWorkdayForMoment,
 } from "@/lib/attendance";
+import { getTimeInRestriction } from "@/lib/attendance-workday";
 import { publishAttendanceUpdate } from "@/lib/attendance-live/service";
 import { startOfZonedDay, zonedNow } from "@/lib/timezone";
 import {
@@ -35,9 +38,7 @@ export async function getSelfAttendanceStatus(input?: { date?: string }) {
     if (Number.isNaN(day.getTime())) {
       return { success: false, error: "Invalid date", reason: "invalid_date" };
     }
-    const dayStart = startOfZonedDay(day);
-    const dayEnd = new Date(dayStart);
-    dayEnd.setDate(dayEnd.getDate() + 1);
+    const requestedDayStart = startOfZonedDay(day);
 
     const employee = await db.employee.findUnique({
       where: { userId: session.userId },
@@ -58,11 +59,20 @@ export async function getSelfAttendanceStatus(input?: { date?: string }) {
       };
     }
 
-    const expected = await getExpectedShiftForDate(employee.employeeId, dayStart);
+    const workday = dateParam
+      ? buildExpectedShiftWorkday(
+          requestedDayStart,
+          await getExpectedShiftForDate(employee.employeeId, requestedDayStart),
+        )
+      : await resolveAttendanceWorkdayForMoment(employee.employeeId, day);
+    const expected = workday.expected;
     const punches = await db.punch.findMany({
       where: {
         employeeId: employee.employeeId,
-        punchTime: { gte: dayStart, lt: dayEnd },
+        punchTime: {
+          gte: workday.punchWindowStart,
+          lt: workday.punchWindowEnd,
+        },
       },
       orderBy: { punchTime: "asc" },
     });
@@ -142,11 +152,14 @@ export async function recordSelfPunch(input: {
     }
 
     const now = zonedNow();
-    const todayStart = startOfZonedDay(now);
-    const expected = await getExpectedShiftForDate(employee.employeeId, todayStart);
+    const workday = await resolveAttendanceWorkdayForMoment(
+      employee.employeeId,
+      now,
+    );
     const dayState = await getAttendanceFreezeStateForMoment(
       employee.employeeId,
       now,
+      workday.dayStart,
     );
     if (dayState?.payrollPeriodId) {
       return {
@@ -165,17 +178,15 @@ export async function recordSelfPunch(input: {
     }
 
     if (punchType === PUNCH_TYPE.TIME_IN) {
-      if (expected.scheduledStartMinutes == null) {
+      const restriction = getTimeInRestriction(workday, now);
+      if (restriction === "no_shift_today") {
         return {
           success: false,
           error: "No scheduled shift for today",
           reason: "no_shift_today",
         };
       }
-      const minutesSinceStart = Math.round(
-        (now.getTime() - todayStart.getTime()) / 60000,
-      );
-      if (minutesSinceStart < expected.scheduledStartMinutes) {
+      if (restriction === "too_early") {
         return {
           success: false,
           error:
@@ -183,10 +194,7 @@ export async function recordSelfPunch(input: {
           reason: "too_early",
         };
       }
-      if (
-        expected.scheduledEndMinutes != null &&
-        minutesSinceStart > expected.scheduledEndMinutes
-      ) {
+      if (restriction === "too_late") {
         return {
           success: false,
           error: "Cannot clock in after your scheduled end time.",
@@ -199,6 +207,7 @@ export async function recordSelfPunch(input: {
       employeeId: employee.employeeId,
       punchType: punchType as PUNCH_TYPE,
       punchTime: now,
+      workDate: workday.dayStart,
       source: "WEB_SELF",
       recompute: true,
     });
@@ -219,7 +228,7 @@ export async function recordSelfPunch(input: {
 
     await publishAttendanceUpdate({
       employeeId: employee.employeeId,
-      workDate: todayStart,
+      workDate: workday.dayStart,
       punchId: punch.punch.id,
     });
 

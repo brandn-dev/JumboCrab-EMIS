@@ -81,9 +81,10 @@ export type AttendanceFreezeState = {
 export const getAttendanceFreezeStateForMoment = async (
   employeeId: string,
   punchTime: Date,
+  workDate: Date = punchTime,
 ) => {
-  const dayStart = startOfZonedDay(punchTime);
-  const dayEnd = endOfZonedDay(punchTime);
+  const dayStart = startOfZonedDay(workDate);
+  const dayEnd = endOfZonedDay(workDate);
   const attendance = await db.attendance.findFirst({
     where: {
       employeeId,

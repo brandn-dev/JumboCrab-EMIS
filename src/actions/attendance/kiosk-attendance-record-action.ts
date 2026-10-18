@@ -6,11 +6,14 @@ import { db } from "@/lib/db";
 import { consumeKioskQrScanAck, storeKioskQrScanAck } from "@/lib/kiosk-qr-ack";
 import { verifyPassword } from "@/lib/auth";
 import {
+  buildExpectedShiftWorkday,
   createPunchAndMaybeRecompute,
   getExpectedShiftForDate,
+  resolveAttendanceWorkdayForMoment,
 } from "@/lib/attendance";
+import { getTimeInRestriction } from "@/lib/attendance-workday";
 import { publishAttendanceUpdate } from "@/lib/attendance-live/service";
-import { endOfZonedDay, startOfZonedDay, zonedNow } from "@/lib/timezone";
+import { startOfZonedDay, zonedNow } from "@/lib/timezone";
 import {
   isKioskPunchIpAllowed,
   serializeKioskPunch,
@@ -125,17 +128,34 @@ export async function recordKioskPunch(input: {
     if (Number.isNaN(baseDate.getTime())) {
       return { success: false, error: "Invalid date", reason: "invalid_date" };
     }
-    const dayStart = startOfZonedDay(baseDate);
-    const dayEnd = endOfZonedDay(baseDate);
+    const requestedDayStart = startOfZonedDay(baseDate);
+    const todayStart = startOfZonedDay(now);
+    const activeWorkday = await resolveAttendanceWorkdayForMoment(
+      user.employee.employeeId,
+      now,
+    );
+    const workday =
+      !dateParam || requestedDayStart.getTime() === todayStart.getTime()
+        ? activeWorkday
+        : buildExpectedShiftWorkday(
+            requestedDayStart,
+            await getExpectedShiftForDate(
+              user.employee.employeeId,
+              requestedDayStart,
+            ),
+          );
 
-    const punchesToday = await db.punch.findMany({
+    const workdayPunches = await db.punch.findMany({
       where: {
         employeeId: user.employee.employeeId,
-        punchTime: { gte: dayStart, lt: dayEnd },
+        punchTime: {
+          gte: workday.punchWindowStart,
+          lt: workday.punchWindowEnd,
+        },
       },
       orderBy: { punchTime: "asc" },
     });
-    const lastType = punchesToday[punchesToday.length - 1]
+    const lastType = workdayPunches[workdayPunches.length - 1]
       ?.punchType as PUNCH_TYPE | undefined;
     const allowedNext: Record<PUNCH_TYPE | "NONE", PUNCH_TYPE> = {
       NONE: PUNCH_TYPE.TIME_IN,
@@ -146,18 +166,15 @@ export async function recordKioskPunch(input: {
     };
     const key = lastType ?? "NONE";
     const expectedNext = allowedNext[key as keyof typeof allowedNext];
-    const lastPunchDate = punchesToday[punchesToday.length - 1]?.punchTime ?? null;
+    const lastPunchDate =
+      workdayPunches[workdayPunches.length - 1]?.punchTime ?? null;
     const sameDay =
-      lastPunchDate && lastPunchDate >= dayStart && lastPunchDate < dayEnd;
+      lastPunchDate &&
+      lastPunchDate >= workday.punchWindowStart &&
+      lastPunchDate < workday.punchWindowEnd;
 
     if (punchType === PUNCH_TYPE.TIME_IN) {
-      const expected = await getExpectedShiftForDate(
-        user.employee.employeeId,
-        dayStart,
-      );
-      const todayStart = startOfZonedDay(now);
-
-      if (dayStart.getTime() !== todayStart.getTime()) {
+      if (workday.dayStart.getTime() !== activeWorkday.dayStart.getTime()) {
         return {
           success: false,
           error: "Clock in is only allowed on today's scheduled shift date.",
@@ -165,7 +182,8 @@ export async function recordKioskPunch(input: {
         };
       }
 
-      if (expected.scheduledStartMinutes == null) {
+      const restriction = getTimeInRestriction(workday, now);
+      if (restriction === "no_shift_today") {
         return {
           success: false,
           error: "No scheduled shift for today",
@@ -173,10 +191,7 @@ export async function recordKioskPunch(input: {
         };
       }
 
-      const minutesSinceStart = Math.round(
-        (now.getTime() - dayStart.getTime()) / 60000,
-      );
-      if (minutesSinceStart < expected.scheduledStartMinutes) {
+      if (restriction === "too_early") {
         return {
           success: false,
           error: "Too early to clock in. Wait for your scheduled start time.",
@@ -184,10 +199,7 @@ export async function recordKioskPunch(input: {
         };
       }
 
-      if (
-        expected.scheduledEndMinutes != null &&
-        minutesSinceStart > expected.scheduledEndMinutes
-      ) {
+      if (restriction === "too_late") {
         return {
           success: false,
           error: "Cannot clock in after your scheduled end time.",
@@ -218,6 +230,7 @@ export async function recordKioskPunch(input: {
       employeeId: user.employee.employeeId,
       punchType: punchType as PUNCH_TYPE,
       punchTime: now,
+      workDate: workday.dayStart,
       source: "KIOSK",
       recompute: true,
     });
@@ -234,7 +247,7 @@ export async function recordKioskPunch(input: {
 
     await publishAttendanceUpdate({
       employeeId: user.employee.employeeId,
-      workDate: dayStart,
+      workDate: workday.dayStart,
       punchId: result.punch.id,
     });
 

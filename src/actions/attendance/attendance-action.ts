@@ -41,6 +41,7 @@ import {
   listEmployeeFaceVerificationAttempts as listEmployeeFaceVerificationAttemptsImpl,
   revokeEmployeeFaceEnrollment as revokeEmployeeFaceEnrollmentImpl,
   verifyFaceAndRecordKioskPunch as verifyFaceAndRecordKioskPunchImpl,
+  verifyFaceAndRecordQrPunch as verifyFaceAndRecordQrPunchImpl,
 } from "./face-recognition-action";
 
 export async function listAttendance(
@@ -191,6 +192,12 @@ export async function revokeEmployeeFaceEnrollment(
   ...args: Parameters<typeof revokeEmployeeFaceEnrollmentImpl>
 ) {
   return revokeEmployeeFaceEnrollmentImpl(...args);
+}
+
+export async function verifyFaceAndRecordQrPunch(
+  ...args: Parameters<typeof verifyFaceAndRecordQrPunchImpl>
+) {
+  return verifyFaceAndRecordQrPunchImpl(...args);
 }
 
 export async function verifyFaceAndRecordKioskPunch(

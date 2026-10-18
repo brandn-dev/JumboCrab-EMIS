@@ -20,17 +20,6 @@ type AttendanceSecuritySettingsForm = {
   gpsValidationEnabled: boolean;
   attendancePunchMode: AttendancePunchMode;
   faceLivenessRequired: boolean;
-  activeFaceChallengeRequired: boolean;
-  identityContinuityRequired: boolean;
-  passiveAntiSpoofRequired: boolean;
-  faceChallengeExpiresSeconds: number;
-  faceChallengeMaxFrames: number;
-  faceChallengeMaxPayloadBytes: number;
-  faceChallengeMaxAttemptsPerMinute: number;
-  faceChallengeMaxFailures: number;
-  faceChallengeCooldownSeconds: number;
-  faceContinuityFrameCount: number;
-  faceContinuityMaxDistance: number;
   faceMatchMaxDistance: number;
   faceFailureMode: string;
 };
@@ -38,110 +27,21 @@ type AttendanceSecuritySettingsForm = {
 const defaultForm: AttendanceSecuritySettingsForm = {
   gpsValidationEnabled: false,
   attendancePunchMode: "QR_ONLY",
-  faceLivenessRequired: true,
-  activeFaceChallengeRequired: true,
-  identityContinuityRequired: true,
-  passiveAntiSpoofRequired: false,
-  faceChallengeExpiresSeconds: 20,
-  faceChallengeMaxFrames: 24,
-  faceChallengeMaxPayloadBytes: 1_250_000,
-  faceChallengeMaxAttemptsPerMinute: 5,
-  faceChallengeMaxFailures: 3,
-  faceChallengeCooldownSeconds: 60,
-  faceContinuityFrameCount: 5,
-  faceContinuityMaxDistance: 0.35,
+  faceLivenessRequired: false,
   faceMatchMaxDistance: 0.35,
   faceFailureMode: "BLOCK",
 };
 
 const toggleRows: Array<{
-  key:
-    | "gpsValidationEnabled"
-    | "activeFaceChallengeRequired"
-    | "identityContinuityRequired"
-    | "passiveAntiSpoofRequired";
+  key: "gpsValidationEnabled" | "faceLivenessRequired";
   title: string;
   description: string;
-  requiredForFace?: boolean;
 }> = [
   {
     key: "gpsValidationEnabled",
     title: "Capture location when available",
     description:
       "Attach optional location coordinates to attendance punch context.",
-  },
-  {
-    key: "activeFaceChallengeRequired",
-    title: "Require active liveness challenge",
-    description:
-      "Server selects blink plus a random head turn and verifies their order.",
-    requiredForFace: true,
-  },
-  {
-    key: "identityContinuityRequired",
-    title: "Require identity continuity",
-    description: "Require same enrolled employee in every accepted capture frame.",
-    requiredForFace: true,
-  },
-  {
-    key: "passiveAntiSpoofRequired",
-    title: "Require passive anti-spoof",
-    description:
-      "Fail closed when passive PAD is unavailable. Current face service reports unavailable.",
-  },
-];
-
-const numberRows: Array<{
-  key:
-    | "faceChallengeExpiresSeconds"
-    | "faceChallengeMaxFrames"
-    | "faceChallengeMaxPayloadBytes"
-    | "faceChallengeMaxAttemptsPerMinute"
-    | "faceChallengeMaxFailures"
-    | "faceChallengeCooldownSeconds"
-    | "faceContinuityFrameCount"
-    | "faceContinuityMaxDistance";
-  title: string;
-  description: string;
-  min: number;
-  max: number;
-  step?: number;
-}> = [
-  {
-    key: "faceChallengeExpiresSeconds",
-    title: "Challenge lifetime (seconds)",
-    description: "Short window from server issue through final verification.",
-    min: 15,
-    max: 30,
-  },
-  {
-    key: "faceChallengeMaxAttemptsPerMinute",
-    title: "Attempts per employee per minute",
-    description: "Rate limit for new server challenges.",
-    min: 1,
-    max: 10,
-  },
-  {
-    key: "faceChallengeMaxFailures",
-    title: "Failures before cooldown",
-    description: "Recent failed challenges allowed before temporary cooldown.",
-    min: 1,
-    max: 10,
-  },
-  {
-    key: "faceChallengeCooldownSeconds",
-    title: "Failure cooldown (seconds)",
-    description: "Wait time after failure limit is reached.",
-    min: 10,
-    max: 300,
-  },
-  {
-    key: "faceContinuityMaxDistance",
-    title: "Continuity distance threshold",
-    description: "Maximum adjacent-frame identity distance. Lower is stricter.",
-    min: 0.25,
-    max: 0.45,
-    step: 0.01,
   },
 ];
 
@@ -195,27 +95,6 @@ export function AttendanceSecuritySettingsPage() {
           defaultForm.attendancePunchMode,
         faceLivenessRequired:
           result.data.faceLivenessRequired ?? defaultForm.faceLivenessRequired,
-        activeFaceChallengeRequired:
-          result.data.activeFaceChallengeRequired ?? true,
-        identityContinuityRequired:
-          result.data.identityContinuityRequired ?? true,
-        passiveAntiSpoofRequired:
-          result.data.passiveAntiSpoofRequired ?? false,
-        faceChallengeExpiresSeconds:
-          result.data.faceChallengeExpiresSeconds ?? 20,
-        faceChallengeMaxFrames: result.data.faceChallengeMaxFrames ?? 24,
-        faceChallengeMaxPayloadBytes:
-          result.data.faceChallengeMaxPayloadBytes ?? 1_250_000,
-        faceChallengeMaxAttemptsPerMinute:
-          result.data.faceChallengeMaxAttemptsPerMinute ?? 5,
-        faceChallengeMaxFailures:
-          result.data.faceChallengeMaxFailures ?? 3,
-        faceChallengeCooldownSeconds:
-          result.data.faceChallengeCooldownSeconds ?? 60,
-        faceContinuityFrameCount:
-          result.data.faceContinuityFrameCount ?? 5,
-        faceContinuityMaxDistance:
-          result.data.faceContinuityMaxDistance ?? 0.35,
         faceMatchMaxDistance:
           result.data.faceMatchMaxDistance ?? defaultForm.faceMatchMaxDistance,
         faceFailureMode:
@@ -340,11 +219,7 @@ export function AttendanceSecuritySettingsPage() {
               </div>
               <input
                 type="checkbox"
-                  checked={form[setting.key]}
-                  disabled={
-                    setting.requiredForFace &&
-                    form.attendancePunchMode !== "QR_ONLY"
-                  }
+                checked={form[setting.key]}
                 onChange={(event) =>
                   setForm((current) => ({
                     ...current,
@@ -354,34 +229,6 @@ export function AttendanceSecuritySettingsPage() {
                 className="mt-1 h-4 w-4"
               />
             </label>
-          ))}
-        </div>
-
-        <div className="grid gap-3 md:grid-cols-2">
-          {numberRows.map((setting) => (
-            <div
-              key={setting.key}
-              className="rounded-xl border border-border/70 bg-muted/10 p-4"
-            >
-              <p className="font-medium">{setting.title}</p>
-              <p className="mb-2 text-sm text-muted-foreground">
-                {setting.description}
-              </p>
-              <Input
-                type="number"
-                min={setting.min}
-                max={setting.max}
-                step={setting.step ?? 1}
-                value={form[setting.key]}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    [setting.key]: Number(event.target.value),
-                  }))
-                }
-                className="max-w-xs"
-              />
-            </div>
           ))}
         </div>
 

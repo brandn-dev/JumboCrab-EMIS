@@ -1,8 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { PUNCH_TYPE } from "@prisma/client";
 import { db } from "@/lib/db";
-import { getExpectedShiftForDate } from "@/lib/attendance";
-import { endOfZonedDay, startOfZonedDay, zonedNow } from "@/lib/timezone";
+import { resolveAttendanceWorkdayForMoment } from "@/lib/attendance";
+import { getTimeInRestriction } from "@/lib/attendance-workday";
+import { zonedNow } from "@/lib/timezone";
 import { getAttendanceFreezeStateForMoment } from "./attendance-shared";
 
 const EMPLOYEE_QR_PREFIX = "JC_ATT_V1";
@@ -208,10 +209,15 @@ export const prepareKioskPunchContext = async (
   | { success: false; error: string; reason: string }
 > => {
   const now = zonedNow();
-  const dayStart = startOfZonedDay(now);
-  const dayEnd = endOfZonedDay(now);
-  const expected = await getExpectedShiftForDate(employee.employeeId, dayStart);
-  const dayState = await getAttendanceFreezeStateForMoment(employee.employeeId, now);
+  const workday = await resolveAttendanceWorkdayForMoment(
+    employee.employeeId,
+    now,
+  );
+  const dayState = await getAttendanceFreezeStateForMoment(
+    employee.employeeId,
+    now,
+    workday.dayStart,
+  );
 
   if (dayState?.payrollPeriodId) {
     return {
@@ -229,14 +235,17 @@ export const prepareKioskPunchContext = async (
     };
   }
 
-  const punchesToday = await db.punch.findMany({
+  const workdayPunches = await db.punch.findMany({
     where: {
       employeeId: employee.employeeId,
-      punchTime: { gte: dayStart, lt: dayEnd },
+      punchTime: {
+        gte: workday.punchWindowStart,
+        lt: workday.punchWindowEnd,
+      },
     },
     orderBy: { punchTime: "asc" },
   });
-  const lastPunch = punchesToday[punchesToday.length - 1] ?? null;
+  const lastPunch = workdayPunches[workdayPunches.length - 1] ?? null;
   if (lastPunch?.punchType === PUNCH_TYPE.TIME_OUT) {
     return {
       success: false,
@@ -247,27 +256,22 @@ export const prepareKioskPunchContext = async (
 
   const nextPunch = getExpectedNextPunch(lastPunch?.punchType ?? null);
   if (nextPunch === PUNCH_TYPE.TIME_IN) {
-    if (expected.scheduledStartMinutes == null) {
+    const restriction = getTimeInRestriction(workday, now);
+    if (restriction === "no_shift_today") {
       return {
         success: false,
         error: "No scheduled shift for today",
         reason: "no_shift_today",
       };
     }
-    const minutesSinceStart = Math.round(
-      (now.getTime() - dayStart.getTime()) / 60000,
-    );
-    if (minutesSinceStart < expected.scheduledStartMinutes) {
+    if (restriction === "too_early") {
       return {
         success: false,
         error: "Too early to clock in. Wait for scheduled start time.",
         reason: "too_early",
       };
     }
-    if (
-      expected.scheduledEndMinutes != null &&
-      minutesSinceStart > expected.scheduledEndMinutes
-    ) {
+    if (restriction === "too_late") {
       return {
         success: false,
         error: "Cannot clock in after scheduled end time.",
@@ -282,7 +286,7 @@ export const prepareKioskPunchContext = async (
       employee,
       nextPunch,
       now,
-      dayStart,
+      dayStart: workday.dayStart,
     },
   };
 };

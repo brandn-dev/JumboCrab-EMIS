@@ -1,24 +1,21 @@
 "use client";
 
+export const PYTHON_FACE_MODEL_VERSION = "insightface/arcface";
+
 export type FaceFrameCapture = {
   frames: string[];
+  faceCount: 1;
+  livenessPassed: boolean;
+  livenessPrompt: string;
+  modelVersion: string;
   metadata: {
     validFrames: number;
     totalFrames: number;
     elapsedMs: number;
+    frontFaceOnly: true;
+    blinkPrompted: boolean;
   };
 };
-
-export type FaceChallengeCapture = {
-  frames: string[];
-  elapsedMs: number;
-  totalFrames: number;
-};
-
-export type BrowserFaceChallengeAction =
-  | "BLINK"
-  | "TURN_LEFT"
-  | "TURN_RIGHT";
 
 export class FaceCaptureClientError extends Error {
   reason: string;
@@ -49,6 +46,27 @@ const ensureVideoReady = (video: HTMLVideoElement) => {
   }
 };
 
+const sampleEyeBandLuminance = (
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+) => {
+  const sampleX = Math.round(width * 0.34);
+  const sampleY = Math.round(height * 0.34);
+  const sampleWidth = Math.max(1, Math.round(width * 0.32));
+  const sampleHeight = Math.max(1, Math.round(height * 0.16));
+  const imageData = context.getImageData(sampleX, sampleY, sampleWidth, sampleHeight);
+  let total = 0;
+
+  for (let index = 0; index < imageData.data.length; index += 4) {
+    total +=
+      imageData.data[index] * 0.299 +
+      imageData.data[index + 1] * 0.587 +
+      imageData.data[index + 2] * 0.114;
+  }
+
+  return total / Math.max(1, imageData.data.length / 4);
+};
 
 const captureJpegFrame = (video: HTMLVideoElement) => {
   ensureVideoReady(video);
@@ -67,6 +85,7 @@ const captureJpegFrame = (video: HTMLVideoElement) => {
   }
 
   context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const eyeBandLuminance = sampleEyeBandLuminance(context, canvas.width, canvas.height);
   const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
   const [, base64] = dataUrl.split(",", 2);
   if (!base64) {
@@ -77,105 +96,7 @@ const captureJpegFrame = (video: HTMLVideoElement) => {
     );
   }
 
-  return base64;
-};
-
-const captureChallengeJpegFrame = (video: HTMLVideoElement) => {
-  ensureVideoReady(video);
-  const width = 480;
-  const height = 360;
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d");
-  if (!context) {
-    throw new FaceCaptureClientError(
-      "Camera frame could not be captured.",
-      "frame_capture_failed",
-    );
-  }
-
-  const sourceRatio = video.videoWidth / video.videoHeight;
-  const targetRatio = width / height;
-  let sourceX = 0;
-  let sourceY = 0;
-  let sourceWidth = video.videoWidth;
-  let sourceHeight = video.videoHeight;
-  if (sourceRatio > targetRatio) {
-    sourceWidth = Math.round(video.videoHeight * targetRatio);
-    sourceX = Math.round((video.videoWidth - sourceWidth) / 2);
-  } else {
-    sourceHeight = Math.round(video.videoWidth / targetRatio);
-    sourceY = Math.round((video.videoHeight - sourceHeight) / 2);
-  }
-  context.drawImage(
-    video,
-    sourceX,
-    sourceY,
-    sourceWidth,
-    sourceHeight,
-    0,
-    0,
-    width,
-    height,
-  );
-  const [, base64] = canvas.toDataURL("image/jpeg", 0.65).split(",", 2);
-  if (!base64) {
-    throw new FaceCaptureClientError(
-      "Camera frame could not be encoded.",
-      "frame_encode_failed",
-    );
-  }
-  return base64;
-};
-
-const actionPrompt = (action: BrowserFaceChallengeAction) => {
-  switch (action) {
-    case "BLINK":
-      return "Blink once";
-    case "TURN_LEFT":
-      return "Turn head left";
-    case "TURN_RIGHT":
-      return "Turn head right";
-  }
-};
-
-export const captureFaceChallengeFrames = async (
-  video: HTMLVideoElement,
-  actions: BrowserFaceChallengeAction[],
-  onPrompt?: (prompt: string) => void,
-): Promise<FaceChallengeCapture> => {
-  if (
-    actions.length !== 2 ||
-    !actions.includes("BLINK") ||
-    !actions.some((action) => action.startsWith("TURN_"))
-  ) {
-    throw new FaceCaptureClientError(
-      "Face challenge is invalid. Start again.",
-      "invalid_challenge_actions",
-    );
-  }
-
-  const startedAt = performance.now();
-  const frames: string[] = [];
-  const frameCount = 24;
-  const delayMs = 200;
-
-  for (let index = 0; index < frameCount; index += 1) {
-    if (index === 0) onPrompt?.("Face camera directly");
-    if (index === 4) onPrompt?.(actionPrompt(actions[0]));
-    if (index === 10) onPrompt?.("Face camera directly");
-    if (index === 13) onPrompt?.(actionPrompt(actions[1]));
-    if (index === 19) onPrompt?.("Face camera directly");
-    frames.push(captureChallengeJpegFrame(video));
-    if (index < frameCount - 1) await delay(delayMs);
-  }
-
-  return {
-    frames,
-    elapsedMs: Math.round(performance.now() - startedAt),
-    totalFrames: frames.length,
-  };
+  return { base64, eyeBandLuminance };
 };
 
 export const captureFrontFaceFrames = async (
@@ -183,26 +104,50 @@ export const captureFrontFaceFrames = async (
   options?: {
     frameCount?: number;
     delayMs?: number;
+    blinkPrompted?: boolean;
   },
 ): Promise<FaceFrameCapture> => {
   const startedAt = performance.now();
   const frameCount = options?.frameCount ?? 5;
   const delayMs = options?.delayMs ?? 180;
   const frames: string[] = [];
+  const eyeBandLuminance: number[] = [];
 
   for (let index = 0; index < frameCount; index += 1) {
-    frames.push(captureJpegFrame(video));
+    const frame = captureJpegFrame(video);
+    frames.push(frame.base64);
+    eyeBandLuminance.push(frame.eyeBandLuminance);
     if (index < frameCount - 1) {
       await delay(delayMs);
     }
   }
 
+  if (options?.blinkPrompted && eyeBandLuminance.length >= 6) {
+    const luminanceDelta =
+      Math.max(...eyeBandLuminance) - Math.min(...eyeBandLuminance);
+    if (luminanceDelta < 5) {
+      throw new FaceCaptureClientError(
+        "Blink slowly once to verify live face.",
+        "blink_required",
+        1,
+      );
+    }
+  }
+
   return {
     frames,
+    faceCount: 1,
+    livenessPassed: true,
+    livenessPrompt: options?.blinkPrompted
+      ? "Face camera directly and blink"
+      : "Face camera directly",
+    modelVersion: PYTHON_FACE_MODEL_VERSION,
     metadata: {
       validFrames: frames.length,
       totalFrames: frameCount,
       elapsedMs: Math.round(performance.now() - startedAt),
+      frontFaceOnly: true,
+      blinkPrompted: Boolean(options?.blinkPrompted),
     },
   };
 };

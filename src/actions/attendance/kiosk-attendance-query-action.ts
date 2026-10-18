@@ -1,8 +1,12 @@
 "use server";
 
 import { db } from "@/lib/db";
-import { getExpectedShiftForDate } from "@/lib/attendance";
-import { endOfZonedDay, startOfZonedDay, zonedNow } from "@/lib/timezone";
+import {
+  buildExpectedShiftWorkday,
+  getExpectedShiftForDate,
+  resolveAttendanceWorkdayForMoment,
+} from "@/lib/attendance";
+import { startOfZonedDay, zonedNow } from "@/lib/timezone";
 import {
   computeKioskBreakStats,
   serializeKioskPunch,
@@ -84,17 +88,29 @@ export async function getKioskStatus(input: {
     if (Number.isNaN(baseDate.getTime())) {
       return { success: false, error: "Invalid date", reason: "invalid_date" };
     }
-    const dayStart = startOfZonedDay(baseDate);
-    const dayEnd = endOfZonedDay(baseDate);
-
-    const expected = await getExpectedShiftForDate(
-      user.employee.employeeId,
-      dayStart,
-    );
+    const requestedDayStart = startOfZonedDay(baseDate);
+    const todayStart = startOfZonedDay(now);
+    const workday =
+      !dateParam || requestedDayStart.getTime() === todayStart.getTime()
+        ? await resolveAttendanceWorkdayForMoment(
+            user.employee.employeeId,
+            now,
+          )
+        : buildExpectedShiftWorkday(
+            requestedDayStart,
+            await getExpectedShiftForDate(
+              user.employee.employeeId,
+              requestedDayStart,
+            ),
+          );
+    const expected = workday.expected;
     const punches = await db.punch.findMany({
       where: {
         employeeId: user.employee.employeeId,
-        punchTime: { gte: dayStart, lt: dayEnd },
+        punchTime: {
+          gte: workday.punchWindowStart,
+          lt: workday.punchWindowEnd,
+        },
       },
       orderBy: { punchTime: "asc" },
       select: { punchTime: true, punchType: true },

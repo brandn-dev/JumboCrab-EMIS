@@ -5,6 +5,7 @@ import { db } from "@/lib/db";
 import {
   createPunchAndMaybeRecompute,
   recomputeAttendanceForDay,
+  resolveAttendanceWorkdayForMoment,
 } from "@/lib/attendance";
 import { publishAttendanceUpdate } from "@/lib/attendance-live/service";
 import { endOfZonedDay, startOfZonedDay } from "@/lib/timezone";
@@ -13,7 +14,6 @@ import {
   getAttendanceFreezeStateForMoment,
   serializeAttendance,
   serializePunch,
-  toDayKey,
 } from "./attendance-shared";
 
 export async function listAttendancePunches(input: {
@@ -93,9 +93,14 @@ export async function updatePunch(input: {
       return { success: false, error: "Punch not found" };
     }
 
+    const originalWorkday = await resolveAttendanceWorkdayForMoment(
+      existing.employeeId,
+      existing.punchTime,
+    );
     const originalDayState = await getAttendanceFreezeStateForMoment(
       existing.employeeId,
       existing.punchTime,
+      originalWorkday.dayStart,
     );
     const originalDayError = getAttendanceFreezeError(
       originalDayState,
@@ -120,10 +125,18 @@ export async function updatePunch(input: {
       if (Number.isNaN(parsed.getTime())) {
         return { success: false, error: "Invalid punchTime" };
       }
-      if (toDayKey(parsed) !== toDayKey(existing.punchTime)) {
+      const targetWorkday = await resolveAttendanceWorkdayForMoment(
+        existing.employeeId,
+        parsed,
+      );
+      if (
+        targetWorkday.dayStart.getTime() !==
+        originalWorkday.dayStart.getTime()
+      ) {
         const targetDayState = await getAttendanceFreezeStateForMoment(
           existing.employeeId,
           parsed,
+          targetWorkday.dayStart,
         );
         const targetDayError = getAttendanceFreezeError(
           targetDayState,
@@ -160,18 +173,22 @@ export async function updatePunch(input: {
       },
     });
 
-    const originalWorkDate = startOfZonedDay(existing.punchTime);
-    const updatedWorkDate = startOfZonedDay(updated.punchTime);
+    const updatedWorkday = await resolveAttendanceWorkdayForMoment(
+      updated.employeeId,
+      updated.punchTime,
+    );
+    const originalWorkDate = originalWorkday.dayStart;
+    const updatedWorkDate = updatedWorkday.dayStart;
 
     if (updated.employeeId && updated.punchTime) {
-      await recomputeAttendanceForDay(updated.employeeId, updated.punchTime);
+      await recomputeAttendanceForDay(updated.employeeId, updatedWorkDate);
     }
 
     if (
       updated.employeeId &&
       originalWorkDate.getTime() !== updatedWorkDate.getTime()
     ) {
-      await recomputeAttendanceForDay(updated.employeeId, existing.punchTime);
+      await recomputeAttendanceForDay(updated.employeeId, originalWorkDate);
       await publishAttendanceUpdate({
         employeeId: updated.employeeId,
         workDate: originalWorkDate,
@@ -210,9 +227,14 @@ export async function deletePunch(input: { id: string }) {
       return { success: false, error: "Punch not found" };
     }
 
+    const workday = await resolveAttendanceWorkdayForMoment(
+      existing.employeeId,
+      existing.punchTime,
+    );
     const dayState = await getAttendanceFreezeStateForMoment(
       existing.employeeId,
       existing.punchTime,
+      workday.dayStart,
     );
     const dayError = getAttendanceFreezeError(
       dayState,
@@ -226,10 +248,10 @@ export async function deletePunch(input: { id: string }) {
     }
 
     await db.punch.delete({ where: { id } });
-    await recomputeAttendanceForDay(existing.employeeId, existing.punchTime);
+    await recomputeAttendanceForDay(existing.employeeId, workday.dayStart);
     await publishAttendanceUpdate({
       employeeId: existing.employeeId,
-      workDate: startOfZonedDay(existing.punchTime),
+      workDate: workday.dayStart,
       deletedPunchId: existing.id,
     });
 
@@ -277,9 +299,14 @@ export async function recordAttendancePunch(input: {
       return { success: false, error: "punchTime is invalid" };
     }
 
+    const workday = await resolveAttendanceWorkdayForMoment(
+      employeeId,
+      punchTime,
+    );
     const dayState = await getAttendanceFreezeStateForMoment(
       employeeId,
       punchTime,
+      workday.dayStart,
     );
     const dayError = getAttendanceFreezeError(
       dayState,
@@ -296,13 +323,14 @@ export async function recordAttendancePunch(input: {
       employeeId,
       punchType: punchType as PUNCH_TYPE,
       punchTime,
+      workDate: workday.dayStart,
       source,
       recompute,
     });
 
     await publishAttendanceUpdate({
       employeeId,
-      workDate: startOfZonedDay(punchTime),
+      workDate: workday.dayStart,
       punchId: punch.id,
     });
 

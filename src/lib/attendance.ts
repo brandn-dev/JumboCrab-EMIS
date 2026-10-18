@@ -7,10 +7,16 @@ import {
   Shift,
 } from "@prisma/client";
 import { db } from "./db";
+import {
+  ATTENDANCE_SHIFT_END_GRACE_MINUTES,
+  buildAttendanceWorkdayWindow,
+  isActiveOvernightCarryover,
+  type AttendanceWorkdayWindow,
+} from "./attendance-workday";
 import { startOfZonedDay, endOfZonedDay, TZ } from "./timezone";
 import { normalizeWeekStart } from "./week-planner";
 
-type ExpectedShift = {
+export type ExpectedShift = {
   shift: Shift | null;
   scheduledStartMinutes: number | null;
   scheduledEndMinutes: number | null;
@@ -18,7 +24,6 @@ type ExpectedShift = {
 };
 
 type DayKey = "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat";
-const AUTO_TIMEOUT_GRACE_MINUTES = 60; //AUTO TIME OUT DURATION AFTER SCHEDULE END
 const DEFAULT_LATE_GRACE_MINUTES = 0;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -510,24 +515,69 @@ export async function getExpectedShiftForDate(
   };
 }
 
+export type ResolvedAttendanceWorkday = AttendanceWorkdayWindow & {
+  expected: ExpectedShift;
+};
+
+export const buildExpectedShiftWorkday = (
+  dayStart: Date,
+  expected: ExpectedShift,
+): ResolvedAttendanceWorkday => {
+  const window = buildAttendanceWorkdayWindow(dayStart, {
+    startMinutes: expected.scheduledStartMinutes,
+    endMinutes: expected.scheduledEndMinutes,
+    spansMidnight: Boolean(expected.shift?.spansMidnight),
+  });
+  return { ...window, expected };
+};
+
+export async function resolveAttendanceWorkdayForMoment(
+  employeeId: string,
+  moment: Date,
+): Promise<ResolvedAttendanceWorkday> {
+  const currentDayStart = startOfZonedDay(moment);
+  const previousDayStart = new Date(currentDayStart.getTime() - DAY_MS);
+  const previousExpected = await getExpectedShiftForDate(
+    employeeId,
+    previousDayStart,
+  );
+  const previousWorkday = buildExpectedShiftWorkday(
+    previousDayStart,
+    previousExpected,
+  );
+  if (isActiveOvernightCarryover(previousWorkday, moment)) {
+    return previousWorkday;
+  }
+
+  const currentExpected = await getExpectedShiftForDate(
+    employeeId,
+    currentDayStart,
+  );
+  return buildExpectedShiftWorkday(currentDayStart, currentExpected);
+}
+
 export async function recomputeAttendanceForDay(
   employeeId: string,
   workDate: Date,
 ) {
   const dayStart = startOfZonedDay(workDate);
-  const dayEnd = endOfZonedDay(workDate);
   const now = new Date();
   const nowMinutes = minutesBetween(dayStart, now);
+
+  const expected = await getExpectedShiftForDate(employeeId, dayStart);
+  const workday = buildExpectedShiftWorkday(dayStart, expected);
 
   let punches = await db.punch.findMany({
     where: {
       employeeId,
-      punchTime: { gte: dayStart, lt: dayEnd },
+      punchTime: {
+        gte: workday.punchWindowStart,
+        lt: workday.punchWindowEnd,
+      },
     },
     orderBy: { punchTime: "asc" },
   });
 
-  const expected = await getExpectedShiftForDate(employeeId, dayStart);
   const expectedWorkShift =
     expected.shift && !expected.shift.isDayOff ? expected.shift : null;
   const paidHoursPerDay = expectedWorkShift?.paidHoursPerDay ?? null;
@@ -552,19 +602,22 @@ export async function recomputeAttendanceForDay(
   // Auto timeout rule: after scheduled end + 60 minutes, and create AUTO TIME OUT.
   // This keeps attendance from staying INCOMPLETE forever when someone forgets to clock out.
   const autoTimeoutCutoffMinutes =
-    expected.scheduledEndMinutes != null
-      ? Math.max(0, expected.scheduledEndMinutes + AUTO_TIMEOUT_GRACE_MINUTES)
+    workday.normalizedEndMinutes != null
+      ? Math.max(
+          0,
+          workday.normalizedEndMinutes + ATTENDANCE_SHIFT_END_GRACE_MINUTES,
+        )
       : null;
   const shouldAutoTimeout =
-    expected.scheduledEndMinutes != null &&
+    workday.normalizedEndMinutes != null &&
     firstClockIn != null &&
     !lastClockOut &&
     autoTimeoutCutoffMinutes != null &&
     nowMinutes >= autoTimeoutCutoffMinutes;
 
-  if (shouldAutoTimeout && expected.scheduledEndMinutes != null) {
+  if (shouldAutoTimeout && workday.normalizedEndMinutes != null) {
     const autoTimeoutAt = new Date(
-      dayStart.getTime() + expected.scheduledEndMinutes * 60 * 1000, //expected timeout * 60sec per min* 1000ms = 60,000 ms
+      dayStart.getTime() + workday.normalizedEndMinutes * 60 * 1000,
     );
     const hasTimeoutAtScheduledEnd = punches.some(
       (p) =>
@@ -586,7 +639,10 @@ export async function recomputeAttendanceForDay(
     punches = await db.punch.findMany({
       where: {
         employeeId,
-        punchTime: { gte: dayStart, lt: dayEnd },
+        punchTime: {
+          gte: workday.punchWindowStart,
+          lt: workday.punchWindowEnd,
+        },
       },
       orderBy: { punchTime: "asc" },
     });
@@ -619,8 +675,8 @@ export async function recomputeAttendanceForDay(
 
   // Lock and mark incomplete once we're 5 minutes after scheduled end (clamped to 0).
   const cutoffMinutes =
-    expected.scheduledEndMinutes != null
-      ? Math.max(0, expected.scheduledEndMinutes + 5)
+    workday.normalizedEndMinutes != null
+      ? Math.max(0, workday.normalizedEndMinutes + 5)
       : null;
   const cutoffPassed =
     cutoffMinutes != null ? nowMinutes >= cutoffMinutes : false;
@@ -759,7 +815,13 @@ export async function recomputeAttendanceForDay(
   // Link punches to the attendance record for traceability
   if (attendance?.id) {
     await db.punch.updateMany({
-      where: { employeeId, punchTime: { gte: dayStart, lt: dayEnd } },
+      where: {
+        employeeId,
+        punchTime: {
+          gte: workday.punchWindowStart,
+          lt: workday.punchWindowEnd,
+        },
+      },
       data: { attendanceId: attendance.id },
     });
   }
@@ -773,10 +835,12 @@ export async function createPunchAndMaybeRecompute(options: {
   employeeId: string;
   punchType: PUNCH_TYPE;
   punchTime: Date;
+  workDate?: Date;
   source?: string | null;
   recompute?: boolean;
 }) {
-  const { employeeId, punchType, punchTime, source, recompute } = options;
+  const { employeeId, punchType, punchTime, workDate, source, recompute } =
+    options;
   const punch = await db.punch.create({
     data: {
       employeeId,
@@ -788,9 +852,12 @@ export async function createPunchAndMaybeRecompute(options: {
 
   let attendance = null;
   if (recompute) {
+    const workday = workDate
+      ? { dayStart: startOfZonedDay(workDate) }
+      : await resolveAttendanceWorkdayForMoment(employeeId, punchTime);
     const { attendance: updated } = await recomputeAttendanceForDay(
       employeeId,
-      punchTime,
+      workday.dayStart,
     );
     attendance = updated;
   }
